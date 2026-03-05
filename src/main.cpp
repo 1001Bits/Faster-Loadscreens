@@ -139,14 +139,14 @@ namespace
     {
     public:
         VRLoadingScreensMod() :
-            ModBase(Settings("VRLoadingScreens", "1.1.0", &g_config, 64, true))
+            ModBase(Settings("VRLoadingScreens", "1.0.0", &g_config, 64, true))
         {
         }
 
     protected:
         void onModLoaded(const F4SE::LoadInterface* f4SE) override
         {
-            logger::info("VRLoadingScreens v1.1.0 loaded");
+            logger::info("VRLoadingScreens v1.0.0 loaded");
         }
 
         void onGameLoaded() override

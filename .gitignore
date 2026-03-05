@@ -3,5 +3,11 @@ package/Data/F4SE/Plugins/VRLoadingScreens.dll
 *.user
 *.suo
 .vs/
+.claude/
 CMakeSettings.json
 out/
+data/
+verify_export/
+*.swf
+Loading menu swf edited/
+Loading menu swt unedited/
