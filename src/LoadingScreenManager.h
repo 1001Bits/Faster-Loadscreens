@@ -26,12 +26,17 @@ namespace VRLoadingScreens
             m_gameSessionLoaded = true;
             m_needsDesyncFix = true;
         }
+        bool IsInLoadingScreen() const { return m_inLoadingScreen.load(); }
         void SetBackgroundsEnabled(bool enabled) { m_backgroundsEnabled = enabled; }
         void SetRenderDelay(float seconds) { m_renderDelaySeconds = seconds; }
         void SetOverlayMode(int mode) { m_overlayMode = mode; }
         void SetOverlayAlpha(float alpha) { m_overlayAlpha = alpha; }
         void SetTimingOnly(bool timingOnly) { m_timingOnly = timingOnly; }
         bool IsEnabled() const { return m_enabled; }
+
+        // Retry texture loading after device becomes available (NG deferred init)
+        void RetryTextureLoad() { PrepareNextBackground(); }
+        void* GetCurrentBgTexture() const { return m_currentBgTexture; }
 
     private:
         LoadingScreenManager() = default;
@@ -47,6 +52,7 @@ namespace VRLoadingScreens
         int m_lastIndex = -1;
         bool m_enabled = true;
         bool m_backgroundsEnabled = true;
+        bool m_isVR = false;
         int m_overlayMode = 0; // 0=HMD, 1=World-locked, 2=Cinema, 3=Submit, 4=ClearRTV
         float m_overlayAlpha = 0.5f;
         bool m_timingOnly = false;
@@ -55,11 +61,9 @@ namespace VRLoadingScreens
 
         std::mt19937 m_rng{ std::random_device{}() };
         std::chrono::steady_clock::time_point m_loadStartTime;
-        std::chrono::steady_clock::time_point m_lastOpenTime;
         std::chrono::steady_clock::time_point m_lastCloseTime;
         bool m_pendingDesyncFix = false;
         bool m_needsDesyncFix = false;
-        bool m_needsNewBackground = false;
         bool m_needsOverlayHide = false;
         std::chrono::steady_clock::time_point m_overlayHideTime;
         long long m_sinceLastClose = 0;

@@ -1,4 +1,6 @@
 build/
+build_og/
+release/
 package/Data/F4SE/Plugins/VRLoadingScreens.dll
 *.user
 *.suo
@@ -11,3 +13,7 @@ verify_export/
 *.swf
 Loading menu swf edited/
 Loading menu swt unedited/
+*.7z
+loadscreens/
+src_backup_vr_only/
+triplets/

@@ -12,15 +12,19 @@
 
 using namespace std::literals;
 
-#include "Logger.h"
-
-using namespace f4cf;
+// Logging — CommonLibF4 sets up spdlog; use the standard logger macro
+namespace logger = F4SE::log;
 
 #define DLLEXPORT __declspec(dllexport)
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <intrin.h>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>

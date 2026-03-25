@@ -1,10 +1,16 @@
 #include "PCH.h"
 #include "D3D11Compositor.h"
 #include "VRCompositorHelper.h"
+#include "PerformancePatches.h"
+#include "LoadingScreenManager.h"
 
 // Include D3D11 directly for full API access (REX::W32 only has subset)
 #include <d3d11.h>
+#include <dxgi.h>
+#include <dxgi1_2.h>
+#include <MinHook.h>
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
 namespace VRLoadingScreens
 {
@@ -33,7 +39,9 @@ VS_OUT main(uint id : SV_VertexID) {
     static const char* PS_LUMINANCE_KEY_SRC = R"(
 cbuffer Params : register(b0) {
     float threshold;
-    float3 _pad;
+    float bgUvScaleX;
+    float bgUvScaleY;
+    float _pad;
 };
 
 Texture2D gameTex : register(t0);
@@ -42,21 +50,37 @@ SamplerState samp : register(s0);
 
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float4 game = gameTex.Sample(samp, uv);
+    // Aspect-correct UV for background (crop excess to fill screen)
+    float2 bgUV = float2(0.5 + (uv.x - 0.5) * bgUvScaleX,
+                         0.5 + (uv.y - 0.5) * bgUvScaleY);
+    float4 bg = bgTex.Sample(samp, bgUV);
     float lum = dot(game.rgb, float3(0.299, 0.587, 0.114));
-    if (lum > threshold)
-        return game;
-
-    float4 bg = bgTex.Sample(samp, uv);
-    return float4(bg.rgb, 1.0);
+    // Smooth blend: dark pixels → background, bright pixels (text) → game
+    float alpha = saturate(lum / threshold);
+    // Mask out bottom-right corner (spinner/VaultTec logo region)
+    float maskX = smoothstep(0.82, 0.88, uv.x);
+    float maskY = smoothstep(0.82, 0.88, uv.y);
+    alpha *= 1.0 - maskX * maskY;
+    return lerp(bg, game, alpha * alpha);
 }
 )";
 
     static const char* PS_BACKGROUND_SRC = R"(
+cbuffer Params : register(b0) {
+    float threshold;
+    float bgUvScaleX;
+    float bgUvScaleY;
+    float _pad;
+};
+
 Texture2D bgTex     : register(t0);
 SamplerState samp   : register(s0);
 
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    return float4(bgTex.Sample(samp, uv).rgb, 1.0);
+    // Aspect-correct UV for background (crop excess to fill screen)
+    float2 bgUV = float2(0.5 + (uv.x - 0.5) * bgUvScaleX,
+                         0.5 + (uv.y - 0.5) * bgUvScaleY);
+    return float4(bgTex.Sample(samp, bgUV).rgb, 1.0);
 }
 )";
 
@@ -92,16 +116,528 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         int eColorSpace;
     };
 
-    struct VRTextureWithPose_t
-    {
-        void* handle;
-        int eType;
-        int eColorSpace;
-        float mDeviceToAbsoluteTracking[3][4];
-    };
-
     // ========================================================================
     // Initialization
+    // ========================================================================
+
+    // ========================================================================
+    // Flat mode initialization — hooks Present for background compositing
+    // ========================================================================
+
+    // SEH-safe helper: try to read device/swapchain from RendererData
+    // Must be in its own function because __try can't coexist with C++ objects
+    static bool TryReadRendererData_SEH(void* rendererData, void** outDevice, void** outSwapChain)
+    {
+        __try {
+            auto base = reinterpret_cast<std::uintptr_t>(rendererData);
+            *outDevice = *reinterpret_cast<void**>(base + 0x48);
+            *outSwapChain = *reinterpret_cast<void**>(base + 0x58);
+            return (*outDevice != nullptr && *outSwapChain != nullptr);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    bool D3D11Compositor::TryGetDeviceFromRendererData()
+    {
+        try {
+            auto* rendererData = RE::BSGraphics::RendererData::GetSingleton();
+            if (rendererData) {
+                void* dev = nullptr;
+                void* sc = nullptr;
+                if (TryReadRendererData_SEH(rendererData, &dev, &sc)) {
+                    m_device = dev;
+                    m_swapChain = sc;
+                    logger::info("D3D11Compositor: got device from RendererData");
+                    return true;
+                }
+                logger::warn("D3D11Compositor: RendererData access failed, using dummy device fallback");
+            }
+        } catch (...) {
+            logger::warn("D3D11Compositor: RendererData lookup failed, using dummy device fallback");
+        }
+        return false;
+    }
+
+    bool D3D11Compositor::InitializeFlat()
+    {
+        if (m_initialized) return true;
+
+        m_isVR = false;
+        s_instance = this;
+
+        // Always use MinHook for flat (RendererData offsets vary between OG/NG)
+        bool gotDevice = false;
+
+        // Fallback: create a dummy swapchain to discover the Present function address,
+        // then use MinHook to inline-hook the actual function code.
+        // This avoids modifying the global DXGI vtable (which crashes NG).
+        if (!gotDevice) {
+            logger::info("D3D11Compositor: using MinHook to hook Present...");
+
+            // Initialize MinHook
+            MH_STATUS mhStatus = MH_Initialize();
+            if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
+                logger::error("D3D11Compositor: MinHook init failed ({})", MH_StatusToString(mhStatus));
+                return false;
+            }
+
+            WNDCLASSEXA wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = DefWindowProcA;
+            wc.hInstance = GetModuleHandleA(nullptr);
+            wc.lpszClassName = "LoadingScreensDummy";
+            RegisterClassExA(&wc);
+
+            HWND hWnd = CreateWindowExA(0, wc.lpszClassName, "", WS_OVERLAPPEDWINDOW,
+                0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
+
+            // Create D3D11 device + swapchain to discover Present address
+            ID3D11Device* dummyDev = nullptr;
+            ID3D11DeviceContext* dummyCtx = nullptr;
+            IDXGISwapChain* dummySC = nullptr;
+            D3D_FEATURE_LEVEL fl;
+
+            DXGI_SWAP_CHAIN_DESC sd = {};
+            sd.BufferCount = 1;
+            sd.BufferDesc.Width = 2;
+            sd.BufferDesc.Height = 2;
+            sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            sd.OutputWindow = hWnd;
+            sd.SampleDesc.Count = 1;
+            sd.Windowed = TRUE;
+            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+            HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+                nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd,
+                &dummySC, &dummyDev, &fl, &dummyCtx);
+
+            if (FAILED(hr) || !dummySC) {
+                DestroyWindow(hWnd);
+                UnregisterClassA(wc.lpszClassName, wc.hInstance);
+                logger::error("D3D11Compositor: dummy device creation failed (hr={:x})", (unsigned)hr);
+                return false;
+            }
+
+            // Read the Present function address from the dummy swapchain's vtable
+            void** vtable = *reinterpret_cast<void***>(dummySC);
+            void* presentAddr = vtable[8];
+            logger::info("D3D11Compositor: discovered Present at {:x}",
+                reinterpret_cast<std::uintptr_t>(presentAddr));
+
+            // Cleanup dummy objects BEFORE hooking (no vtable modification)
+            dummySC->Release();
+            if (dummyCtx) dummyCtx->Release();
+            dummyDev->Release();
+            DestroyWindow(hWnd);
+            UnregisterClassA(wc.lpszClassName, wc.hInstance);
+
+            // Inline-hook the Present function code with MinHook
+            void* originalTrampoline = nullptr;
+            mhStatus = MH_CreateHook(presentAddr, reinterpret_cast<void*>(&HookedPresentFlat),
+                &originalTrampoline);
+            if (mhStatus != MH_OK) {
+                logger::error("D3D11Compositor: MH_CreateHook failed ({})", MH_StatusToString(mhStatus));
+                return false;
+            }
+
+            s_originalPresentFlat = reinterpret_cast<decltype(s_originalPresentFlat)>(originalTrampoline);
+
+            mhStatus = MH_EnableHook(presentAddr);
+            if (mhStatus != MH_OK) {
+                logger::error("D3D11Compositor: MH_EnableHook failed ({})", MH_StatusToString(mhStatus));
+                return false;
+            }
+
+            m_flatLazyInit = true;
+            m_initialized = true;
+            logger::info("D3D11Compositor: Present inline-hooked via MinHook (original trampoline={:x})",
+                reinterpret_cast<std::uintptr_t>(originalTrampoline));
+            return true;
+
+            // unreachable — old error path removed
+            return false;
+        }
+
+        // Normal path: device obtained from RendererData
+        if (!m_device) {
+            logger::error("D3D11Compositor::InitializeFlat: no D3D11 device");
+            return false;
+        }
+
+        // Get immediate context
+        auto* device = static_cast<ID3D11Device*>(m_device);
+        ID3D11DeviceContext* ctx = nullptr;
+        device->GetImmediateContext(&ctx);
+        if (!ctx) {
+            logger::error("D3D11Compositor::InitializeFlat: no immediate context");
+            return false;
+        }
+        m_context = ctx;
+
+        if (!CompileShaders()) {
+            logger::error("D3D11Compositor::InitializeFlat: shader compilation failed");
+            ctx->Release();
+            m_context = nullptr;
+            return false;
+        }
+
+        logger::info("D3D11Compositor: creating D3D state objects...");
+
+        // Create D3D state objects
+        D3D11_SAMPLER_DESC sampDesc = {};
+        sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        ID3D11SamplerState* sampler = nullptr;
+        device->CreateSamplerState(&sampDesc, &sampler);
+        m_sampler = sampler;
+        logger::info("D3D11Compositor: sampler OK");
+
+        D3D11_BUFFER_DESC cbDesc = {};
+        cbDesc.ByteWidth = sizeof(CompositeParams);
+        cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+        cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ID3D11Buffer* cb = nullptr;
+        device->CreateBuffer(&cbDesc, nullptr, &cb);
+        m_constantBuffer = cb;
+
+        D3D11_BLEND_DESC blendDesc = {};
+        blendDesc.RenderTarget[0].BlendEnable = FALSE;
+        blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        ID3D11BlendState* blend = nullptr;
+        device->CreateBlendState(&blendDesc, &blend);
+        m_blendState = blend;
+
+        D3D11_RASTERIZER_DESC rasDesc = {};
+        rasDesc.FillMode = D3D11_FILL_SOLID;
+        rasDesc.CullMode = D3D11_CULL_NONE;
+        ID3D11RasterizerState* ras = nullptr;
+        device->CreateRasterizerState(&rasDesc, &ras);
+        m_rasterState = ras;
+
+        D3D11_DEPTH_STENCIL_DESC dsDesc = {};
+        dsDesc.DepthEnable = FALSE;
+        dsDesc.StencilEnable = FALSE;
+        ID3D11DepthStencilState* ds = nullptr;
+        device->CreateDepthStencilState(&dsDesc, &ds);
+        m_depthState = ds;
+
+        // Hook Present via MinHook (same method as NG — vtable modification is unreliable)
+        if (m_swapChain) {
+            MH_STATUS mhStatus = MH_Initialize();
+            if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
+                logger::error("D3D11Compositor: MinHook init failed ({})", MH_StatusToString(mhStatus));
+                return false;
+            }
+            void** vtable = *reinterpret_cast<void***>(m_swapChain);
+            void* presentAddr = vtable[8];
+            logger::info("D3D11Compositor: discovered Present at {:x} (from RendererData swapchain)",
+                reinterpret_cast<std::uintptr_t>(presentAddr));
+
+            void* originalTrampoline = nullptr;
+            mhStatus = MH_CreateHook(presentAddr, reinterpret_cast<void*>(&HookedPresentFlat),
+                &originalTrampoline);
+            if (mhStatus != MH_OK) {
+                logger::error("D3D11Compositor: MH_CreateHook failed ({})", MH_StatusToString(mhStatus));
+                return false;
+            }
+            s_originalPresentFlat = reinterpret_cast<decltype(s_originalPresentFlat)>(originalTrampoline);
+            mhStatus = MH_EnableHook(presentAddr);
+            if (mhStatus != MH_OK) {
+                logger::error("D3D11Compositor: MH_EnableHook failed ({})", MH_StatusToString(mhStatus));
+                return false;
+            }
+            logger::info("D3D11Compositor: Present inline-hooked via MinHook (from RendererData)");
+        }
+
+        m_initialized = true;
+        logger::info("D3D11Compositor: flat mode initialized");
+        return true;
+    }
+
+    // ========================================================================
+    // Flat lazy init — completes initialization on first Present call
+    // (used when RendererData was unavailable, e.g. NG without address library)
+    // ========================================================================
+
+    bool D3D11Compositor::CompleteFlatInit(void* swapChain)
+    {
+        auto* sc = static_cast<IDXGISwapChain*>(swapChain);
+        ID3D11Device* dev = nullptr;
+        sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev));
+        if (!dev) {
+            logger::error("D3D11Compositor: CompleteFlatInit failed — no device from swapchain");
+            return false;
+        }
+
+        m_device = dev;
+        m_swapChain = swapChain;
+
+        // Also give the device to VRCompositorHelper for DDS texture loading
+        VRCompositorHelper::SetDevice(reinterpret_cast<REX::W32::ID3D11Device*>(dev));
+
+        ID3D11DeviceContext* ctx = nullptr;
+        dev->GetImmediateContext(&ctx);
+        if (!ctx) {
+            logger::error("D3D11Compositor: CompleteFlatInit failed — no context");
+            return false;
+        }
+        m_context = ctx;
+
+        if (!CompileShaders()) {
+            logger::error("D3D11Compositor: CompleteFlatInit failed — shader compilation");
+            ctx->Release();
+            m_context = nullptr;
+            return false;
+        }
+
+        D3D11_SAMPLER_DESC sampDesc = {};
+        sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        ID3D11SamplerState* sampler = nullptr;
+        dev->CreateSamplerState(&sampDesc, &sampler);
+        m_sampler = sampler;
+
+        D3D11_BUFFER_DESC cbDesc = {};
+        cbDesc.ByteWidth = sizeof(CompositeParams);
+        cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+        cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ID3D11Buffer* cb = nullptr;
+        dev->CreateBuffer(&cbDesc, nullptr, &cb);
+        m_constantBuffer = cb;
+
+        D3D11_BLEND_DESC blendDesc = {};
+        blendDesc.RenderTarget[0].BlendEnable = FALSE;
+        blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        ID3D11BlendState* blend = nullptr;
+        dev->CreateBlendState(&blendDesc, &blend);
+        m_blendState = blend;
+
+        D3D11_RASTERIZER_DESC rasDesc = {};
+        rasDesc.FillMode = D3D11_FILL_SOLID;
+        rasDesc.CullMode = D3D11_CULL_NONE;
+        ID3D11RasterizerState* ras = nullptr;
+        dev->CreateRasterizerState(&rasDesc, &ras);
+        m_rasterState = ras;
+
+        D3D11_DEPTH_STENCIL_DESC dsDesc = {};
+        dsDesc.DepthEnable = FALSE;
+        dsDesc.StencilEnable = FALSE;
+        ID3D11DepthStencilState* ds = nullptr;
+        dev->CreateDepthStencilState(&dsDesc, &ds);
+        m_depthState = ds;
+
+        m_flatLazyInit = false;
+        logger::info("D3D11Compositor: flat lazy init complete (device={:x})",
+            reinterpret_cast<std::uintptr_t>(dev));
+
+        // Now that device is available, notify the callback so deferred work
+        // (texture loading, enabling compositing) can proceed
+        if (m_frameCallback) {
+            logger::info("D3D11Compositor: calling frame callback for deferred init...");
+            m_frameCallback();
+            logger::info("D3D11Compositor: frame callback returned");
+        }
+
+        return true;
+    }
+
+    // ========================================================================
+    // Flat Present hook — composites background behind loading screen content
+    // ========================================================================
+
+    HRESULT WINAPI D3D11Compositor::HookedPresentFlat(void* swapChain, UINT syncInterval, UINT flags)
+    {
+        auto* self = s_instance;
+
+        // Lazy init: complete setup on first Present call
+        if (self && self->m_flatLazyInit) {
+            if (!self->CompleteFlatInit(swapChain)) {
+                // Failed — disable and pass through
+                self->m_flatLazyInit = false;
+            }
+        }
+
+
+        if (self) {
+            if (self->m_frameCallback) {
+                self->m_frameCallback();
+            }
+
+            if (self->m_enabled) {
+                // Mode 0 (Blank): kill AdvanceMovie immediately, no compositing
+                // Mode 1 (BG only): kill AdvanceMovie immediately, composite background-only
+                // Mode 2 (BG+tips): luminance key for 5 frames, then kill AdvanceMovie + switch to bg-only
+                if (!self->m_advanceMovieKilled && !self->m_isVR && !REL::Module::IsNG()) {
+                    bool killNow = (self->m_flatMode <= 1) ||
+                                   (self->m_flatMode == 2 && self->m_flatPresentCount >= 5);
+                    if (killNow) {
+                        try {
+                            static constexpr std::uint8_t RET = 0xC3;
+                            REL::Relocation<std::uintptr_t> advanceMovie{ REL::ID(314582) };
+                            self->m_advanceMovieAddr = advanceMovie.address();
+                            self->m_advanceMovieOrigByte = *reinterpret_cast<std::uint8_t*>(self->m_advanceMovieAddr);
+                            REL::safe_write(self->m_advanceMovieAddr, &RET, 1);
+                            self->m_advanceMovieKilled = true;
+                            self->m_flatBackgroundOnly = true;  // switch to bg-only after kill
+                            logger::info("OG: AdvanceMovie RET at frame {} mode={} (saved 0x{:02x})",
+                                self->m_flatPresentCount, self->m_flatMode, self->m_advanceMovieOrigByte);
+                        } catch (...) {}
+                    }
+                }
+
+                // Composite: mode 0 = nothing, mode 1/2 = background (with or without luminance key)
+                if (self->m_flatMode > 0 && self->m_bgSRV) {
+                    auto* sc = static_cast<IDXGISwapChain*>(swapChain);
+                    ID3D11Texture2D* backbuffer = nullptr;
+                    HRESULT hr = sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer));
+                    if (SUCCEEDED(hr) && backbuffer) {
+                        self->CompositeFlatFrame(backbuffer);
+                        backbuffer->Release();
+                    }
+                }
+                self->m_flatPresentCount++;
+            }
+        }
+
+        // During loading on OG: yield PresentThread CPU to loading threads
+        if (self && self->m_enabled && !self->m_isVR && !REL::Module::IsNG()) {
+            SwitchToThread();
+            _mm_pause();
+        }
+
+        // Call original Present (MinHook trampoline or vtable original)
+        return s_originalPresentFlat(swapChain, syncInterval, flags);
+    }
+
+    void D3D11Compositor::CompositeFlatFrame(void* backbufferTex)
+    {
+        if (!m_context || !backbufferTex || !m_bgSRV) return;
+
+        auto* ctx = static_cast<ID3D11DeviceContext*>(m_context);
+        auto* device = static_cast<ID3D11Device*>(m_device);
+        auto* bbTex = static_cast<ID3D11Texture2D*>(backbufferTex);
+
+        D3D11_TEXTURE2D_DESC bbDesc;
+        bbTex->GetDesc(&bbDesc);
+
+        // Mode 1 or after AdvanceMovie kill: background only (no luminance key)
+        // Mode 2 before kill: luminance key (game tips composited over background)
+        bool backgroundOnly = m_flatBackgroundOnly || (m_flatMode == 1);
+
+        if (!backgroundOnly) {
+            // Copy backbuffer to temp texture (game's loading screen content)
+            EnsureTempTexture(bbDesc.Width, bbDesc.Height, bbDesc.Format);
+            if (!m_tempTexture || !m_tempSRV) return;
+            ctx->CopyResource(static_cast<ID3D11Texture2D*>(m_tempTexture), bbTex);
+        }
+
+        // Create RTV on backbuffer
+        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+        rtvDesc.Format = bbDesc.Format;
+        rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        ID3D11RenderTargetView* rtv = nullptr;
+        HRESULT hr = device->CreateRenderTargetView(bbTex, &rtvDesc, &rtv);
+        if (FAILED(hr) || !rtv) return;
+
+        // Save pipeline state
+        ID3D11RenderTargetView* oldRTV = nullptr;
+        ID3D11DepthStencilView* oldDSV = nullptr;
+        D3D11_VIEWPORT oldVP = {};
+        UINT numVP = 1;
+        ctx->OMGetRenderTargets(1, &oldRTV, &oldDSV);
+        ctx->RSGetViewports(&numVP, &oldVP);
+
+        D3D11_VIEWPORT vp = {};
+        vp.Width = static_cast<float>(bbDesc.Width);
+        vp.Height = static_cast<float>(bbDesc.Height);
+        vp.MaxDepth = 1.0f;
+
+        ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        ctx->RSSetViewports(1, &vp);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->IASetInputLayout(nullptr);
+
+        ctx->VSSetShader(static_cast<ID3D11VertexShader*>(m_vsFullscreen), nullptr, 0);
+
+        if (backgroundOnly) {
+            // Background-only: render our image fullscreen, no game content needed
+            ctx->PSSetShader(static_cast<ID3D11PixelShader*>(m_psBackground), nullptr, 0);
+        } else {
+            // Luminance key: blend game content with background
+            ctx->PSSetShader(static_cast<ID3D11PixelShader*>(m_psLuminanceKey), nullptr, 0);
+        }
+
+        // Compute aspect-correct UV scales for background texture
+        if (m_bgWidth > 0 && m_bgHeight > 0) {
+            float texAspect = static_cast<float>(m_bgWidth) / static_cast<float>(m_bgHeight);
+            float screenAspect = static_cast<float>(bbDesc.Width) / static_cast<float>(bbDesc.Height);
+            if (texAspect > screenAspect) {
+                m_compositeParams.bgUvScaleX = screenAspect / texAspect;
+                m_compositeParams.bgUvScaleY = 1.0f;
+            } else {
+                m_compositeParams.bgUvScaleX = 1.0f;
+                m_compositeParams.bgUvScaleY = texAspect / screenAspect;
+            }
+        } else {
+            m_compositeParams.bgUvScaleX = 1.0f;
+            m_compositeParams.bgUvScaleY = 1.0f;
+        }
+
+        // Update constant buffer
+        auto* cb = static_cast<ID3D11Buffer*>(m_constantBuffer);
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (SUCCEEDED(ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            std::memcpy(mapped.pData, &m_compositeParams, sizeof(m_compositeParams));
+            ctx->Unmap(cb, 0);
+        }
+        ctx->PSSetConstantBuffers(0, 1, &cb);
+
+        if (backgroundOnly) {
+            // Background shader uses t0 = background texture
+            ID3D11ShaderResourceView* srv = static_cast<ID3D11ShaderResourceView*>(m_bgSRV);
+            ctx->PSSetShaderResources(0, 1, &srv);
+        } else {
+            // Luminance key uses t0 = game content, t1 = background
+            ID3D11ShaderResourceView* srvs[2] = {
+                static_cast<ID3D11ShaderResourceView*>(m_tempSRV),
+                static_cast<ID3D11ShaderResourceView*>(m_bgSRV)
+            };
+            ctx->PSSetShaderResources(0, 2, srvs);
+        }
+
+        auto* samp = static_cast<ID3D11SamplerState*>(m_sampler);
+        ctx->PSSetSamplers(0, 1, &samp);
+
+        ctx->OMSetBlendState(static_cast<ID3D11BlendState*>(m_blendState), nullptr, 0xFFFFFFFF);
+        ctx->RSSetState(static_cast<ID3D11RasterizerState*>(m_rasterState));
+        ctx->OMSetDepthStencilState(static_cast<ID3D11DepthStencilState*>(m_depthState), 0);
+
+        ctx->Draw(3, 0);
+
+        // Unbind SRVs
+        ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+        ctx->PSSetShaderResources(0, 2, nullSRVs);
+
+        // Restore state
+        ctx->OMSetRenderTargets(1, &oldRTV, oldDSV);
+        ctx->RSSetViewports(1, &oldVP);
+        if (oldRTV) oldRTV->Release();
+        if (oldDSV) oldDSV->Release();
+
+        rtv->Release();
+        m_submitCompositeCount++;
+    }
+
+    // ========================================================================
+    // VR mode initialization
     // ========================================================================
 
     bool D3D11Compositor::Initialize(void* vrCompositor, void* d3dDevice)
@@ -109,6 +645,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         if (m_initialized) return true;
         if (!vrCompositor || !d3dDevice) return false;
 
+        m_isVR = true;
         s_instance = this;
         m_device = d3dDevice;
 
@@ -336,6 +873,8 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         HRESULT hr = device->CreateShaderResourceView(tex, &srvDesc, &srv);
         if (SUCCEEDED(hr)) {
             m_bgSRV = srv;
+            m_bgWidth = texDesc.Width;
+            m_bgHeight = texDesc.Height;
             logger::info("D3D11Compositor: background SRV created ({}x{})",
                 texDesc.Width, texDesc.Height);
         } else {
@@ -349,9 +888,27 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         if (enabled) {
             m_clearMatchCount = 0;
             m_submitCompositeCount = 0;
+            m_flatPresentCount = 0;
+            m_skipPresent = false;
+            m_flatBackgroundOnly = (m_flatMode == 1);  // mode 1 starts in bg-only
 
-            m_compositeParams.threshold = 0.01f;
+            m_compositeParams.threshold = 0.25f;
+            m_compositeParams.bgUvScaleX = 1.0f;
+            m_compositeParams.bgUvScaleY = 1.0f;
+
+            // NG: track load start time for accurate duration measurement
+            if (REL::Module::IsNG()) {
+                m_ngLoadStartTime = std::chrono::steady_clock::now();
+                m_ngLoadNumber++;
+            }
         } else {
+            // Restore AdvanceMovie if we killed it during loading
+            if (m_advanceMovieKilled && m_advanceMovieAddr) {
+                REL::safe_write(m_advanceMovieAddr, &m_advanceMovieOrigByte, 1);
+                m_advanceMovieKilled = false;
+                logger::info("OG: AdvanceMovie restored at {:x}", m_advanceMovieAddr);
+            }
+
             if (m_mode == CompositeMode::ClearIntercept) {
                 logger::info("D3D11Compositor: ClearRTV matched {} times this load", m_clearMatchCount);
             } else {
@@ -451,6 +1008,11 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
         int result = s_originalSubmit(compositor, eye, texture, bounds, flags);
 
+        // Per-frame VR callback (after right eye Submit)
+        if (self && eye == 1 && self->m_frameCallback) {
+            self->m_frameCallback();
+        }
+
         // Deferred NOP: after right eye Submit returns, capture left eye,
         // show overlays, then apply NOP to break the animation loop.
         if (self && eye == 1 && self->m_deferredNOPPending.load()) {
@@ -485,16 +1047,24 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                         fd.Height = cropHeight;
                         fd.MipLevels = 1;
                         fd.ArraySize = 1;
+                        // Use eye texture format, but fall back to R8G8B8A8 if it fails
                         fd.Format = desc.Format;
                         fd.SampleDesc.Count = 1;
                         fd.Usage = D3D11_USAGE_DEFAULT;
                         fd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
                         ID3D11Texture2D* newTex = nullptr;
                         HRESULT hr = device->CreateTexture2D(&fd, nullptr, &newTex);
+                        if (FAILED(hr)) {
+                            // Fallback: R8G8B8A8 is universally supported
+                            fd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                            hr = device->CreateTexture2D(&fd, nullptr, &newTex);
+                            logger::info("Frozen texture fallback to R8G8B8A8 (hr={:x})", (unsigned)hr);
+                        }
                         if (SUCCEEDED(hr)) {
                             self->m_frozenLeftTex = newTex;
                         } else {
-                            logger::error("Failed to create frozen texture (hr={:x})", (unsigned)hr);
+                            logger::error("Failed to create frozen texture (hr={:x}, {}x{}, fmt={})",
+                                (unsigned)hr, halfWidth, cropHeight, (int)desc.Format);
                         }
                     }
 
@@ -575,10 +1145,15 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         m_frozen.store(false);
         m_deferredNOPPending.store(false);
         m_deferredNOPApplied.store(false);
-        // Note: captured frame overlay is NOT hidden here — it's hidden together
-        // with the background overlay in the delayed hide path for synchronised removal.
+        // Don't release overlay textures here — they're still displayed until
+        // HideBackgroundOverlay runs. Release them via ReleaseCapturedTextures()
+        // after the overlays are hidden.
 
-        // Release processed texture so it gets recreated with correct dimensions
+        logger::info("D3D11Compositor: deferred state reset (unfrozen)");
+    }
+
+    void D3D11Compositor::ReleaseCapturedTextures()
+    {
         if (m_processedRTV) {
             static_cast<ID3D11RenderTargetView*>(m_processedRTV)->Release();
             m_processedRTV = nullptr;
@@ -591,8 +1166,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             static_cast<ID3D11ShaderResourceView*>(m_frozenSRV)->Release();
             m_frozenSRV = nullptr;
         }
-
-        logger::info("D3D11Compositor: deferred state reset (unfrozen)");
+        logger::info("D3D11Compositor: captured textures released");
     }
 
     // ========================================================================
@@ -827,6 +1401,22 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         vp.Height = static_cast<float>(eyeDesc.Height);
         vp.MaxDepth = 1.0f;
 
+        // Compute aspect-correct UV scales for VR eye texture
+        if (m_bgWidth > 0 && m_bgHeight > 0) {
+            float texAspect = static_cast<float>(m_bgWidth) / static_cast<float>(m_bgHeight);
+            float eyeAspect = static_cast<float>(eyeDesc.Width) / static_cast<float>(eyeDesc.Height);
+            if (texAspect > eyeAspect) {
+                m_compositeParams.bgUvScaleX = eyeAspect / texAspect;
+                m_compositeParams.bgUvScaleY = 1.0f;
+            } else {
+                m_compositeParams.bgUvScaleX = 1.0f;
+                m_compositeParams.bgUvScaleY = texAspect / eyeAspect;
+            }
+        } else {
+            m_compositeParams.bgUvScaleX = 1.0f;
+            m_compositeParams.bgUvScaleY = 1.0f;
+        }
+
         ctx->OMSetRenderTargets(1, &rtv, nullptr);
         ctx->RSSetViewports(1, &vp);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -834,6 +1424,15 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
         ctx->VSSetShader(static_cast<ID3D11VertexShader*>(m_vsFullscreen), nullptr, 0);
         ctx->PSSetShader(static_cast<ID3D11PixelShader*>(m_psBackground), nullptr, 0);
+
+        // Update constant buffer with aspect-correct UV scales
+        auto* cb = static_cast<ID3D11Buffer*>(m_constantBuffer);
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (SUCCEEDED(ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            std::memcpy(mapped.pData, &m_compositeParams, sizeof(m_compositeParams));
+            ctx->Unmap(cb, 0);
+        }
+        ctx->PSSetConstantBuffers(0, 1, &cb);
 
         auto* bgSRV = static_cast<ID3D11ShaderResourceView*>(m_bgSRV);
         ctx->PSSetShaderResources(0, 1, &bgSRV);
@@ -942,6 +1541,30 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
         ctx->VSSetShader(static_cast<ID3D11VertexShader*>(m_vsFullscreen), nullptr, 0);
         ctx->PSSetShader(static_cast<ID3D11PixelShader*>(m_psBackground), nullptr, 0);
+
+        // Compute aspect-correct UV scales for ClearRTV target
+        if (m_bgWidth > 0 && m_bgHeight > 0) {
+            float texAspect = static_cast<float>(m_bgWidth) / static_cast<float>(m_bgHeight);
+            float rtvAspect = static_cast<float>(desc.Width) / static_cast<float>(desc.Height);
+            if (texAspect > rtvAspect) {
+                m_compositeParams.bgUvScaleX = rtvAspect / texAspect;
+                m_compositeParams.bgUvScaleY = 1.0f;
+            } else {
+                m_compositeParams.bgUvScaleX = 1.0f;
+                m_compositeParams.bgUvScaleY = texAspect / rtvAspect;
+            }
+        } else {
+            m_compositeParams.bgUvScaleX = 1.0f;
+            m_compositeParams.bgUvScaleY = 1.0f;
+        }
+
+        auto* cb = static_cast<ID3D11Buffer*>(m_constantBuffer);
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (SUCCEEDED(ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            std::memcpy(mapped.pData, &m_compositeParams, sizeof(m_compositeParams));
+            ctx->Unmap(cb, 0);
+        }
+        ctx->PSSetConstantBuffers(0, 1, &cb);
 
         auto* bgSRV = static_cast<ID3D11ShaderResourceView*>(m_bgSRV);
         ctx->PSSetShaderResources(0, 1, &bgSRV);

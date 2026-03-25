@@ -6,6 +6,7 @@
 namespace VRLoadingScreens
 {
     // Loading loop exit: CMP [RSI+0x68],2 (4 bytes) + JZ back-to-top (6 bytes) = 10 bytes
+    // Same RVA in VR and OG 1.10.163 (confirmed via Ghidra)
     static constexpr std::uintptr_t AnimationLoop_CMP_Offset = 0xd07573;
 
     static constexpr std::uint8_t NOP10[] = {
@@ -20,6 +21,7 @@ namespace VRLoadingScreens
         m_renderDelaySeconds = renderDelay;
         m_overlayMode = overlayMode;
         m_overlayAlpha = overlayAlpha;
+        m_isVR = REL::Module::IsVR();
 
         ScanForTextures();
 
@@ -29,24 +31,51 @@ namespace VRLoadingScreens
             logger::info("Found {} loading screen textures", m_texturePaths.size());
         }
 
-        // Save original CMP+JZ bytes and pre-unprotect the page
-        REL::Relocation<std::uintptr_t> animCmp{ REL::Offset(AnimationLoop_CMP_Offset) };
-        m_loopAddress = animCmp.address();
-        std::memcpy(m_originalLoopBytes, reinterpret_cast<void*>(m_loopAddress), 10);
-        m_originalBytesSaved = true;
+        // Animation loop NOP (breaks loading render loop for massive speedup)
+        // Dynamically NOP the CMP+JE that controls the animation loop during loading
+        if (m_isVR) {
+            REL::Relocation<std::uintptr_t> animCmp{ REL::Offset(AnimationLoop_CMP_Offset) };
+            m_loopAddress = animCmp.address();
+        } else if (!REL::Module::IsNG()) {
+            // OG flat: CMP [RDI+0x68],2; JE back (10 bytes) at RVA 0xCBFFCD
+            // Found via pattern scan — only match for this loop condition in the binary
+            m_loopAddress = REL::Module::get().base() + 0xCBFFCD;
+        }
 
-        DWORD oldProtect;
-        VirtualProtect(reinterpret_cast<void*>(m_loopAddress), 10, PAGE_EXECUTE_READWRITE, &oldProtect);
+        if (m_loopAddress) {
+            // Verify bytes before saving (CMP opcode = 0x83)
+            auto* b = reinterpret_cast<const std::uint8_t*>(m_loopAddress);
+            if (b[0] == 0x83 && b[2] == 0x68 && b[3] == 0x02) {
+                std::memcpy(m_originalLoopBytes, reinterpret_cast<void*>(m_loopAddress), 10);
+                m_originalBytesSaved = true;
+                DWORD oldProtect;
+                VirtualProtect(reinterpret_cast<void*>(m_loopAddress), 10, PAGE_EXECUTE_READWRITE, &oldProtect);
+                logger::info("Animation loop saved at {:x}", m_loopAddress);
+            } else if (m_isVR) {
+                // VR offset is trusted, save without verification
+                std::memcpy(m_originalLoopBytes, reinterpret_cast<void*>(m_loopAddress), 10);
+                m_originalBytesSaved = true;
+                DWORD oldProtect;
+                VirtualProtect(reinterpret_cast<void*>(m_loopAddress), 10, PAGE_EXECUTE_READWRITE, &oldProtect);
+                logger::info("VR: Animation loop saved at {:x}", m_loopAddress);
+            } else {
+                logger::warn("OG: Animation loop bytes mismatch at {:x} ({:02x})", m_loopAddress, b[0]);
+                m_loopAddress = 0;
+            }
+        }
 
-        logger::info("Saved loop bytes at {:x}, page unprotected, render delay={:.1f}s",
-            m_loopAddress, m_renderDelaySeconds);
-
-        // Initialize VR compositor + overlay
+        // Initialize compositor (VR: OpenVR + overlays, flat: D3D device only)
+        logger::info("Init: calling VRCompositorHelper::Initialize()...");
         VRCompositorHelper::Initialize();
-        VRCompositorHelper::InitializeOverlay();
+        logger::info("Init: VRCompositorHelper initialized OK");
+        if (m_isVR) {
+            VRCompositorHelper::InitializeOverlay();
+        }
 
         if (m_backgroundsEnabled) {
+            logger::info("Init: calling PrepareNextBackground()...");
             PrepareNextBackground();
+            logger::info("Init: PrepareNextBackground OK");
         }
     }
 
@@ -116,40 +145,56 @@ namespace VRLoadingScreens
         m_loopNOPApplied = false;
         m_loadCount++;
 
-        logger::info("LoadingMenu opened (load #{}, mode={}, timingOnly={}, sinceLastClose={}ms)",
-            m_loadCount, m_overlayMode, m_timingOnly, sinceLastClose);
+        // Cancel any pending overlay hide from a previous load close
+        // (prevents mid-load overlay disappearance)
+        m_needsOverlayHide = false;
+
+        logger::info("LoadingMenu opened (load #{}, VR={}, sinceLastClose={}ms)",
+            m_loadCount, m_isVR, sinceLastClose);
 
         if (m_timingOnly) return;
 
         m_sinceLastClose = sinceLastClose;
 
-        // After render delay: SuspendRendering → NOP animation loop → show overlays.
-        // SuspendRendering tells the compositor to stop reading app textures,
-        // which prevents the stereo corruption caused by NOP.
-        if (m_originalBytesSaved) {
+        if (m_isVR && m_originalBytesSaved) {
+            // Immediately hide game's native loading screen with black blocker + fade
+            VRCompositorHelper::FadeToColor(0.0f, 0.0f, 0.0f, 0.0f, 1.0f, false);
+            VRCompositorHelper::ShowBlockerOverlay();
+
+            // VR: delay, then deferred NOP + overlays
             static constexpr float kMainMenuFadeSeconds = 0.5f;
             float effectiveDelay = m_renderDelaySeconds;
             if (!m_gameSessionLoaded) {
                 effectiveDelay = std::max(effectiveDelay, kMainMenuFadeSeconds);
-                logger::info("First load from main menu — using {:.1f}s delay for menu fade", effectiveDelay);
             }
-
             int delayMs = static_cast<int>(effectiveDelay * 1000.0f);
             std::thread([this, delayMs]() {
                 if (delayMs > 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
                 }
                 if (!m_inLoadingScreen.load()) return;
-
-                // Request deferred NOP — applied inside Submit hook after right eye
-                // so both eyes have valid frames before the loop breaks
-                D3D11Compositor::GetSingleton().RequestDeferredNOP(m_loopAddress, NOP10, 10);
-
-                // Show background overlay
+                // Show overlays FIRST so bg overlay is world-locked before deferred NOP fires.
+                // RequestDeferredNOP sets the pending flag, and the next Submit for eye 1
+                // will capture + show the tip overlay — s_bgOverlayActive must be true by then.
                 ShowOverlays();
-
-                logger::info("NOP + overlay applied after {}ms delay", delayMs);
+                D3D11Compositor::GetSingleton().RequestDeferredNOP(m_loopAddress, NOP10, 10);
+                logger::info("VR: overlay + NOP after {}ms delay", delayMs);
             }).detach();
+        } else if (!m_isVR && !REL::Module::IsNG() && m_originalBytesSaved) {
+            // OG flat: apply NOP immediately (no VR compositor concerns)
+            std::memcpy(reinterpret_cast<void*>(m_loopAddress), NOP10, 10);
+            m_loopNOPApplied = true;
+            logger::info("OG: Animation loop NOP applied at {:x}", m_loopAddress);
+        }
+
+        if (!m_isVR) {
+            // Flat: enable compositor (handles AdvanceMovie kill + background compositing)
+            auto& comp = D3D11Compositor::GetSingleton();
+            if (m_backgroundsEnabled && m_currentBgTexture) {
+                comp.SetBackgroundTexture(m_currentBgTexture);
+            }
+            comp.SetEnabled(true);
+            logger::info("Flat: compositor enabled (mode={})", m_backgroundsEnabled ? "bg" : "blank");
         }
     }
 
@@ -171,42 +216,52 @@ namespace VRLoadingScreens
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
         m_inLoadingScreen = false;
 
-        logger::info("Loading screen #{} closed — duration: {:.2f}s ({}ms), loopNOPApplied={}, timingOnly={}",
-            m_loadCount, ms / 1000.0, ms, m_loopNOPApplied.load(), m_timingOnly);
+        logger::info("Loading screen #{} closed — duration: {:.2f}s", m_loadCount, ms / 1000.0);
 
         if (m_timingOnly) return;
 
-        // Restore animation loop if deferred NOP was applied
         auto& compositor = D3D11Compositor::GetSingleton();
-        if (m_originalBytesSaved && compositor.IsDeferredNOPApplied()) {
+
+        // Restore animation loop bytes (VR deferred NOP or OG flat direct NOP)
+        // VR path: m_loopNOPApplied isn't set by the delay thread — the NOP is applied
+        // inside the Submit hook via D3D11Compositor. Check IsDeferredNOPApplied() too.
+        bool needRestore = m_loopNOPApplied ||
+            (m_isVR && D3D11Compositor::GetSingleton().IsDeferredNOPApplied());
+        if (m_originalBytesSaved && needRestore) {
             std::memcpy(reinterpret_cast<void*>(m_loopAddress), m_originalLoopBytes, 10);
-            m_loopNOPApplied = true;  // for log
-            logger::info("Restored loop bytes at {:x}", m_loopAddress);
-        }
-        compositor.ResetDeferredState();
-
-        // Desync fix: only after first save load, consumed once.
-        // Check BEFORE hiding overlays — if moveto is about to fire, keep overlays
-        // visible to avoid the black flash between close→moveto→reopen.
-        bool desyncReloadPending = m_needsDesyncFix;
-        if (m_needsDesyncFix) {
-            m_needsDesyncFix = false;
-            m_pendingDesyncFix = true;
+            m_loopNOPApplied = false;
+            logger::info("Animation loop restored at {:x}", m_loopAddress);
         }
 
-        if (!desyncReloadPending) {
-            // Delay hiding overlays by ~200ms so the game renders a clean gameplay frame
-            // before we reveal it (avoids brief flash of stereo-mismatched loading content)
-            m_needsOverlayHide = true;
-            m_overlayHideTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-            logger::info("Compositor: overlay hide scheduled in 200ms");
+        if (m_isVR) {
+            // Match reference: restore NOP, reset compositor, check desync, hide overlays
+            compositor.ResetDeferredState();
+
+            bool desyncReloadPending = m_needsDesyncFix;
+            if (m_needsDesyncFix) {
+                m_needsDesyncFix = false;
+                m_pendingDesyncFix = true;
+            }
+
+            if (!desyncReloadPending) {
+                // Normal close: schedule delayed overlay hide (matches reference 200ms)
+                m_needsOverlayHide = true;
+                m_overlayHideTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                logger::info("VR: overlay hide scheduled in 200ms");
+            } else {
+                logger::info("VR: keeping overlays visible (desync fix pending)");
+            }
+
+            // Always prepare next background (matches reference)
+            if (m_backgroundsEnabled) {
+                PrepareNextBackground();
+            }
         } else {
-            logger::info("Compositor: keeping overlays visible (desync fix pending)");
-        }
-
-        // Prepare next background texture (new random image for next load)
-        if (m_backgroundsEnabled) {
-            PrepareNextBackground();
+            // Flat: disable compositing
+            compositor.SetEnabled(false);
+            if (m_backgroundsEnabled) {
+                PrepareNextBackground();
+            }
         }
     }
 
@@ -214,26 +269,28 @@ namespace VRLoadingScreens
     {
         if (m_timingOnly) return;
 
-        // Re-apply overlay transform every frame during loading to keep it "stuck"
-        if (m_inLoadingScreen.load()) {
-            VRCompositorHelper::UpdateBackgroundOverlay();
+        if (m_isVR) {
+            // VR: re-apply overlay transform every frame during loading
+            if (m_inLoadingScreen.load()) {
+                VRCompositorHelper::UpdateBackgroundOverlay();
+                D3D11Compositor::GetSingleton().ProcessPendingCapture();
+            }
 
-            // Process captured frame outside the Submit hook (avoids driver crashes)
-            D3D11Compositor::GetSingleton().ProcessPendingCapture();
-        }
+            // Delayed overlay hide (matches reference — 200ms after close)
+            if (m_needsOverlayHide && std::chrono::steady_clock::now() >= m_overlayHideTime) {
+                m_needsOverlayHide = false;
+                VRCompositorHelper::HideBackgroundOverlay();
+                VRCompositorHelper::ClearSkybox();
+                D3D11Compositor::GetSingleton().ReleaseCapturedTextures();
+                logger::info("VR: overlays hidden (delayed)");
+            }
 
-        // Delayed overlay hide — gives the game time to render clean gameplay frames
-        if (m_needsOverlayHide && std::chrono::steady_clock::now() >= m_overlayHideTime) {
-            m_needsOverlayHide = false;
-            VRCompositorHelper::HideBackgroundOverlay();
-            VRCompositorHelper::ClearSkybox();
-            logger::info("Compositor: overlays hidden (delayed), skybox cleared");
-        }
-
-        if (m_pendingDesyncFix && !m_inLoadingScreen.load()) {
-            m_pendingDesyncFix = false;
-            RE::Console::ExecuteCommand("player.moveto player");
-            logger::info("Executed 'player.moveto player' to fix VR desync");
+            // Desync fix (matches reference — runs from Update after close)
+            if (m_pendingDesyncFix && !m_inLoadingScreen.load()) {
+                m_pendingDesyncFix = false;
+                RE::Console::ExecuteCommand("player.moveto player");
+                logger::info("VR: executed desync fix");
+            }
         }
     }
 }

@@ -19,8 +19,11 @@ namespace VRLoadingScreens
             return instance;
         }
 
-        // Initialize with IVRCompositor and D3D11 device
+        // Initialize with IVRCompositor and D3D11 device (VR mode)
         bool Initialize(void* vrCompositor, void* d3dDevice);
+
+        // Initialize for flat mode (hooks Present for background compositing)
+        bool InitializeFlat();
 
         // Set the background texture (ID3D11Texture2D*)
         void SetBackgroundTexture(void* d3dTexture);
@@ -29,19 +32,28 @@ namespace VRLoadingScreens
         void SetEnabled(bool enabled);
         bool IsEnabled() const { return m_enabled; }
         bool IsInitialized() const { return m_initialized; }
+        void SetMenuEventsActive(bool active) { m_menuEventsActive = active; }
 
         // Compositing mode
         void SetMode(CompositeMode mode) { m_mode = mode; }
         CompositeMode GetMode() const { return m_mode; }
 
+        // Flat loading screen mode: 0=blank, 1=background only, 2=background+tips
+        void SetFlatMode(int mode) { m_flatMode = mode; }
+
         // Whether to capture and show the tip+level overlay
         void SetShowCapturedOverlay(bool show) { m_showCapturedOverlay = show; }
+
+        // Per-frame callback (flat mode: called from Present hook for per-frame updates)
+        using FrameCallback = void(*)();
+        void SetFrameCallback(FrameCallback cb) { m_frameCallback = cb; }
 
         // Deferred NOP: applied inside Submit hook after right eye completes
         // (guarantees both eyes have valid frames before the loop breaks)
         void RequestDeferredNOP(std::uintptr_t address, const std::uint8_t* bytes, std::size_t size);
         bool IsDeferredNOPApplied() const { return m_deferredNOPApplied.load(); }
         void ResetDeferredState();
+        void ReleaseCapturedTextures();  // Call after overlays are hidden
 
         // Called from Update() to process captured frame outside the Submit hook
         // (avoids Nvidia driver crashes from D3D11/OpenVR calls during Submit)
@@ -54,10 +66,14 @@ namespace VRLoadingScreens
         // Shader compilation
         bool CompileShaders();
 
-        // Submit hook (mode: LuminanceKey) — called once per eye
+        // Submit hook (VR mode: LuminanceKey) — called once per eye
         static int __cdecl HookedSubmit(void* compositor, int eye,
             const void* texture, const void* bounds, int flags);
         void CompositeFrame(void* eyeTexture2D, int eye);
+
+        // Present hook (flat mode) — composites background behind loading screen
+        static HRESULT WINAPI HookedPresentFlat(void* swapChain, UINT syncInterval, UINT flags);
+        void CompositeFlatFrame(void* backbufferTex);
 
         // ClearRTV hook (mode: ClearIntercept)
         static void __stdcall HookedClearRTV(void* context, void* rtv,
@@ -126,7 +142,6 @@ namespace VRLoadingScreens
         std::atomic<bool> m_frozen{ false };
         std::atomic<bool> m_pendingCaptureProcess{ false };  // Set in Submit, processed in Update
         void* m_frozenLeftTex = nullptr;   // ID3D11Texture2D*
-        void* m_frozenRightTex = nullptr;  // ID3D11Texture2D*
 
         // Alpha-keyed captured frame (black background → transparent)
         void* m_processedTex = nullptr;    // ID3D11Texture2D* (RGBA with alpha)
@@ -137,13 +152,43 @@ namespace VRLoadingScreens
         struct CompositeParams
         {
             float threshold;
-            float pad[3];
+            float bgUvScaleX;   // Aspect-correct UV scale for background texture
+            float bgUvScaleY;
+            float pad;
         };
         CompositeParams m_compositeParams = {};
+
+        // Background texture dimensions (for aspect ratio correction)
+        unsigned int m_bgWidth = 0;
+        unsigned int m_bgHeight = 0;
+
+        // Flat mode state
+        void* m_swapChain = nullptr;       // IDXGISwapChain*
+        bool m_isVR = false;
+        bool m_flatLazyInit = false;       // True when using dummy device fallback
+        FrameCallback m_frameCallback = nullptr;
+        std::uint32_t m_flatPresentCount = 0;
+        bool m_skipPresent = false;
+        bool m_flatBackgroundOnly = false;  // true = draw background only (no luminance key)
+        int m_flatMode = 2;                 // 0=blank, 1=bg only, 2=bg+tips
+        bool m_advanceMovieKilled = false;
+        std::uint8_t m_advanceMovieOrigByte = 0;
+        std::uintptr_t m_advanceMovieAddr = 0;
+
+        // Lazy init helper — complete initialization on first Present call
+        bool CompleteFlatInit(void* swapChain);
+        bool TryGetDeviceFromRendererData();
+
+        // NG loading state
+        bool m_menuEventsActive = false;
+        std::chrono::steady_clock::time_point m_ngLoadStartTime{};
+        int m_ngLoadNumber = 0;
 
         // Original function pointers
         static inline decltype(&HookedSubmit) s_originalSubmit = nullptr;
         static inline decltype(&HookedClearRTV) s_originalClearRTV = nullptr;
+        static inline decltype(&HookedPresentFlat) s_originalPresentFlat = nullptr;
+        static inline decltype(&HookedPresentFlat) s_originalPresentFlip = nullptr;
         static inline D3D11Compositor* s_instance = nullptr;
     };
 }

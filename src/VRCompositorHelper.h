@@ -12,10 +12,12 @@ namespace VRLoadingScreens
         static void SetBlackSkybox();
         static void ClearSkybox();
         static bool IsInitialized() { return s_initialized; }
+        static bool IsVR() { return s_isVR; }
         static void* GetCompositor() { return s_compositor; }
         static void* GetD3D11Device() { return s_device; }
         static void* GetVRSystem() { return s_vrSystem; }
         static void* GetBlackTexture() { return s_blackTexture; }
+        static void SetDevice(REX::W32::ID3D11Device* dev) { s_device = dev; }
 
         // DDS texture loading (returns uncompressed R8G8B8A8 D3D11 texture)
         static void* LoadDDSTexture(const std::string& filePath);
@@ -24,6 +26,7 @@ namespace VRLoadingScreens
         // IVROverlay for background image + tip text
         static bool InitializeOverlay();
         static void SetImageSkybox(void* d3dTexture);
+        static void ShowBlockerOverlay();  // Immediate black overlay to hide game content
         // overlayMode: 0=HMD-relative, 1=World-locked, 2=Cinema
         static void ShowBackgroundOverlay(void* d3dTexture, int overlayMode = 0, float alpha = 0.5f);
         static void HideBackgroundOverlay();
@@ -99,6 +102,9 @@ namespace VRLoadingScreens
         static bool GetHMDPose(HmdMatrix34& outPose);
         // Compute and apply device-relative transform from world pose + current HMD pose
         static void UpdateBackgroundOverlayTransform(const HmdMatrix34& hmd);
+
+        // Runtime detection
+        static inline bool s_isVR = false;
 
         // Compositor state
         static inline bool s_initialized = false;

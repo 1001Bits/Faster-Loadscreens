@@ -5,97 +5,106 @@
 
 namespace VRLoadingScreens
 {
-    static constexpr std::uintptr_t BSGraphics_RendererData_Offset = 0x060f3ce8;
+    static constexpr std::uintptr_t BSGraphics_RendererData_Offset_VR = 0x060f3ce8;
 
     bool VRCompositorHelper::Initialize()
     {
         if (s_initialized) return true;
 
-        HMODULE openvrDll = GetModuleHandleA("openvr_api.dll");
-        if (!openvrDll) {
-            logger::warn("VRCompositorHelper: openvr_api.dll not loaded");
-            return false;
-        }
+        s_isVR = REL::Module::IsVR();
 
-        using VR_GetGenericInterfaceFn = void*(*)(const char*, int*);
-        auto VR_GetGenericInterface = reinterpret_cast<VR_GetGenericInterfaceFn>(
-            GetProcAddress(openvrDll, "VR_GetGenericInterface"));
-        if (!VR_GetGenericInterface) {
-            logger::warn("VRCompositorHelper: VR_GetGenericInterface not found");
-            return false;
-        }
-
-        int error = 0;
-        s_compositor = VR_GetGenericInterface("IVRCompositor_022", &error);
-        if (!s_compositor) {
-            logger::warn("VRCompositorHelper: IVRCompositor_022 failed (error {}), trying _021", error);
-            s_compositor = VR_GetGenericInterface("IVRCompositor_021", &error);
-        }
-        if (!s_compositor) {
-            logger::error("VRCompositorHelper: could not get IVRCompositor (error {})", error);
-            return false;
-        }
-
-        void** vtable = *reinterpret_cast<void***>(s_compositor);
-        s_getTrackingSpace = reinterpret_cast<GetTrackingSpaceFn>(vtable[1]);
-        s_getLastPoses = reinterpret_cast<GetLastPosesFn>(vtable[3]);
-        s_fadeToColor = reinterpret_cast<FadeToColorFn>(vtable[12]);
-        s_fadeGrid = reinterpret_cast<FadeGridFn>(vtable[14]);
-        s_setSkyboxOverride = reinterpret_cast<SetSkyboxOverrideFn>(vtable[16]);
-        s_clearSkyboxOverride = reinterpret_cast<ClearSkyboxOverrideFn>(vtable[17]);
-        s_suspendRendering = reinterpret_cast<SuspendRenderingFn>(vtable[32]);
-
-        // Get IVRSystem for non-blocking pose queries (safe to call after NOP)
-        int sysError = 0;
-        s_vrSystem = VR_GetGenericInterface("IVRSystem_019", &sysError);
-        if (!s_vrSystem) {
-            s_vrSystem = VR_GetGenericInterface("IVRSystem_020", &sysError);
-        }
-        if (s_vrSystem) {
-            void** sysVtable = *reinterpret_cast<void***>(s_vrSystem);
-            s_getDeviceToAbsTrackingPose = reinterpret_cast<GetDeviceToAbsTrackingPoseFn>(sysVtable[11]);
-            logger::info("VRCompositorHelper: IVRSystem initialized (non-blocking poses)");
+        // --- D3D11 device (needed for both VR and flat) ---
+        if (s_isVR) {
+            REL::Relocation<void**> rendererDataPtr{ REL::Offset(BSGraphics_RendererData_Offset_VR) };
+            void* rendererData = *rendererDataPtr;
+            if (rendererData) {
+                s_device = *reinterpret_cast<REX::W32::ID3D11Device**>(
+                    reinterpret_cast<std::uintptr_t>(rendererData) + 0x48);
+            }
         } else {
-            logger::warn("VRCompositorHelper: IVRSystem not available (error {}), world-lock may hang", sysError);
+            // Flat mode: device will be acquired lazily via Present hook
+            // (RendererData address library IDs may not work for all NG versions)
+            logger::info("VRCompositorHelper: flat mode — device deferred to Present hook");
         }
 
-        // Get D3D11 device
-        REL::Relocation<void**> rendererDataPtr{ REL::Offset(BSGraphics_RendererData_Offset) };
-        void* rendererData = *rendererDataPtr;
-        if (rendererData) {
-            s_device = *reinterpret_cast<REX::W32::ID3D11Device**>(
-                reinterpret_cast<std::uintptr_t>(rendererData) + 0x48);
+        if (s_device) {
+            // Create 1x1 black texture (VR: skybox fallback, flat: unused but harmless)
+            REX::W32::D3D11_TEXTURE2D_DESC desc = {};
+            desc.width = 1;
+            desc.height = 1;
+            desc.mipLevels = 1;
+            desc.arraySize = 1;
+            desc.format = REX::W32::DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.sampleDesc.count = 1;
+            desc.usage = REX::W32::D3D11_USAGE_DEFAULT;
+            desc.bindFlags = REX::W32::D3D11_BIND_SHADER_RESOURCE;
 
-            if (s_device) {
-                // Create 1x1 black texture for skybox fallback
-                REX::W32::D3D11_TEXTURE2D_DESC desc = {};
-                desc.width = 1;
-                desc.height = 1;
-                desc.mipLevels = 1;
-                desc.arraySize = 1;
-                desc.format = REX::W32::DXGI_FORMAT_R8G8B8A8_UNORM;
-                desc.sampleDesc.count = 1;
-                desc.usage = REX::W32::D3D11_USAGE_DEFAULT;
-                desc.bindFlags = REX::W32::D3D11_BIND_SHADER_RESOURCE;
+            std::uint32_t blackPixel = 0xFF000000;
+            REX::W32::D3D11_SUBRESOURCE_DATA initData = {};
+            initData.sysMem = &blackPixel;
+            initData.sysMemPitch = 4;
 
-                std::uint32_t blackPixel = 0xFF000000;
-                REX::W32::D3D11_SUBRESOURCE_DATA initData = {};
-                initData.sysMem = &blackPixel;
-                initData.sysMemPitch = 4;
-
-                REX::W32::ID3D11Texture2D* tex = nullptr;
-                HRESULT hr = s_device->CreateTexture2D(&desc, &initData, &tex);
-                if (SUCCEEDED(hr) && tex) {
-                    s_blackTexture = tex;
-                    logger::info("VRCompositorHelper: created 1x1 black texture");
-                }
+            REX::W32::ID3D11Texture2D* tex = nullptr;
+            HRESULT hr = s_device->CreateTexture2D(&desc, &initData, &tex);
+            if (SUCCEEDED(hr) && tex) {
+                s_blackTexture = tex;
             }
         }
 
-        s_initialized = true;
-        logger::info("VRCompositorHelper: initialized (skybox={}, device={})",
-            s_blackTexture != nullptr, s_device != nullptr);
-        return true;
+        // --- VR-only: OpenVR compositor and system ---
+        if (s_isVR) {
+            HMODULE openvrDll = GetModuleHandleA("openvr_api.dll");
+            if (!openvrDll) {
+                logger::warn("VRCompositorHelper: openvr_api.dll not loaded");
+                // Still mark initialized for D3D device access
+                s_initialized = (s_device != nullptr);
+                return s_initialized;
+            }
+
+            using VR_GetGenericInterfaceFn = void*(*)(const char*, int*);
+            auto VR_GetGenericInterface = reinterpret_cast<VR_GetGenericInterfaceFn>(
+                GetProcAddress(openvrDll, "VR_GetGenericInterface"));
+            if (!VR_GetGenericInterface) {
+                s_initialized = (s_device != nullptr);
+                return s_initialized;
+            }
+
+            int error = 0;
+            s_compositor = VR_GetGenericInterface("IVRCompositor_022", &error);
+            if (!s_compositor) {
+                s_compositor = VR_GetGenericInterface("IVRCompositor_021", &error);
+            }
+            if (!s_compositor) {
+                logger::error("VRCompositorHelper: could not get IVRCompositor (error {})", error);
+                s_initialized = (s_device != nullptr);
+                return s_initialized;
+            }
+
+            void** vtable = *reinterpret_cast<void***>(s_compositor);
+            s_getTrackingSpace = reinterpret_cast<GetTrackingSpaceFn>(vtable[1]);
+            s_getLastPoses = reinterpret_cast<GetLastPosesFn>(vtable[3]);
+            s_fadeToColor = reinterpret_cast<FadeToColorFn>(vtable[12]);
+            s_fadeGrid = reinterpret_cast<FadeGridFn>(vtable[14]);
+            s_setSkyboxOverride = reinterpret_cast<SetSkyboxOverrideFn>(vtable[16]);
+            s_clearSkyboxOverride = reinterpret_cast<ClearSkyboxOverrideFn>(vtable[17]);
+            s_suspendRendering = reinterpret_cast<SuspendRenderingFn>(vtable[32]);
+
+            int sysError = 0;
+            s_vrSystem = VR_GetGenericInterface("IVRSystem_019", &sysError);
+            if (!s_vrSystem) {
+                s_vrSystem = VR_GetGenericInterface("IVRSystem_020", &sysError);
+            }
+            if (s_vrSystem) {
+                void** sysVtable = *reinterpret_cast<void***>(s_vrSystem);
+                s_getDeviceToAbsTrackingPose = reinterpret_cast<GetDeviceToAbsTrackingPoseFn>(sysVtable[11]);
+                logger::info("VRCompositorHelper: IVRSystem initialized");
+            }
+        }
+
+        s_initialized = (s_device != nullptr);
+        logger::info("VRCompositorHelper: initialized (VR={}, device={}, compositor={})",
+            s_isVR, s_device != nullptr, s_compositor != nullptr);
+        return s_initialized;
     }
 
     // ========================================================================
@@ -206,6 +215,27 @@ namespace VRLoadingScreens
         } else {
             logger::info("SetSkyboxOverride: image skybox set");
         }
+    }
+
+    void VRCompositorHelper::ShowBlockerOverlay()
+    {
+        if (!s_overlayInitialized || !s_overlay || !s_blockerOverlayHandle || !s_blackTexture) return;
+
+        VRTexture blockerTex;
+        blockerTex.handle = s_blackTexture;
+        blockerTex.eType = 0;
+        blockerTex.eColorSpace = 1;
+        s_ovrSetTexture(s_overlay, s_blockerOverlayHandle, &blockerTex);
+        s_ovrSetAlpha(s_overlay, s_blockerOverlayHandle, 1.0f);
+
+        HmdMatrix34 blockerRel = {};
+        blockerRel.m[0][0] = 1.0f;
+        blockerRel.m[1][1] = 1.0f;
+        blockerRel.m[2][2] = 1.0f;
+        blockerRel.m[2][3] = -3.0f;
+        s_ovrSetTransformDevRel(s_overlay, s_blockerOverlayHandle, 0, &blockerRel);
+        s_ovrShow(s_overlay, s_blockerOverlayHandle);
+        logger::info("VROverlay: blocker shown (immediate)");
     }
 
     void VRCompositorHelper::ShowBackgroundOverlay(void* d3dTexture, int overlayMode, float alpha)
@@ -319,24 +349,7 @@ namespace VRLoadingScreens
             logger::info("VROverlay: background shown");
         }
 
-        // Show blocker overlay (black, covers full FOV to hide controllers below bg)
-        if (s_blockerOverlayHandle && s_blackTexture) {
-            VRTexture blockerTex;
-            blockerTex.handle = s_blackTexture;
-            blockerTex.eType = 0;
-            blockerTex.eColorSpace = 1;
-            s_ovrSetTexture(s_overlay, s_blockerOverlayHandle, &blockerTex);
-
-            // HMD-relative so it always covers the full FOV regardless of head movement
-            HmdMatrix34 blockerRel = {};
-            blockerRel.m[0][0] = 1.0f;
-            blockerRel.m[1][1] = 1.0f;
-            blockerRel.m[2][2] = 1.0f;
-            blockerRel.m[2][3] = -3.0f;
-            s_ovrSetTransformDevRel(s_overlay, s_blockerOverlayHandle, 0, &blockerRel);
-            s_ovrShow(s_overlay, s_blockerOverlayHandle);
-            logger::info("VROverlay: blocker shown (30m wide, HMD-relative, sort=98)");
-        }
+        ShowBlockerOverlay();
     }
 
     void VRCompositorHelper::UpdateBackgroundOverlayTransform(const HmdMatrix34& hmd)
@@ -418,15 +431,21 @@ namespace VRLoadingScreens
     {
         if (!s_overlayInitialized || !s_overlay) return;
         s_bgOverlayActive = false;
+        s_capturedOverlayActive = false;
         s_updateLogCounter = 0;
+
+        // Hide all overlays FIRST, then clear the fade.
+        // Order matters: the tip overlay is alpha-keyed (transparent areas).
+        // If the fade clears before overlays hide, game world bleeds through
+        // the tip's transparent areas making it look like it disappeared early.
         s_ovrHide(s_overlay, s_bgOverlayHandle);
-        // Hide captured frame overlay at the same time as background
-        HideCapturedFrameOverlay();
-        // Hide blocker too
+        if (s_capturedOverlayHandle) {
+            s_ovrHide(s_overlay, s_capturedOverlayHandle);
+        }
         if (s_blockerOverlayHandle) {
             s_ovrHide(s_overlay, s_blockerOverlayHandle);
         }
-        // Clear the black fade so the game scene is visible again
+        // Now clear the black fade — overlays are already gone
         FadeToColor(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false);
     }
 
@@ -445,10 +464,9 @@ namespace VRLoadingScreens
             return;
         }
 
-        // Separate floating panel positioned based on HMD pose at capture time.
-        // Using the current HMD pose (not stored bg pose) ensures text position
-        // is consistent regardless of head orientation changes between loads.
-        float width = 10.0f;
+        // Use the same world pose as the background overlay so they always align.
+        // Sort order (101 > 100) ensures the captured frame renders on top.
+        float width = s_bgWidthSetting;
         s_ovrSetWidth(s_overlay, s_capturedOverlayHandle, width);
         s_ovrSetAlpha(s_overlay, s_capturedOverlayHandle, 1.0f);
         s_ovrSetSortOrder(s_overlay, s_capturedOverlayHandle, 101);
@@ -456,88 +474,55 @@ namespace VRLoadingScreens
         float bounds[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
         s_ovrSetTextureBounds(s_overlay, s_capturedOverlayHandle, bounds);
 
-        // Build local rotation from yaw + pitch
-        constexpr float DEG2RAD = 3.14159265f / 180.0f;
-        float yawRad = s_tipYawDeg * DEG2RAD;
-        float pitchRad = s_tipPitchDeg * DEG2RAD;
-        float cy = std::cos(yawRad),   sy = std::sin(yawRad);
-        float cp = std::cos(pitchRad), sp = std::sin(pitchRad);
+        if (s_bgOverlayActive) {
+            // Start from background overlay's world pose, then apply offsets and rotation
+            s_capturedWorldPose = s_bgWorldPose;
 
-        // R = Ry * Rx
-        float lr[3][3] = {
-            {  cy,  sy * sp,  sy * cp },
-            { 0.0f,      cp,     -sp  },
-            { -sy,  cy * sp,  cy * cp }
-        };
-
-        // Get current HMD pose for consistent positioning
-        HmdMatrix34 hmd = {};
-        bool gotPose = false;
-        if (s_vrSystem && s_getDeviceToAbsTrackingPose) {
-            TrackedDevicePose poses[1] = {};
-            s_getDeviceToAbsTrackingPose(s_vrSystem, 1, 0.0f, poses, 1);
-            if (poses[0].bPoseIsValid) {
-                hmd = poses[0].mDeviceToAbsoluteTracking;
-                gotPose = true;
+            // Offset along overlay's local axes: X (right) and Y (up)
+            for (int row = 0; row < 3; row++) {
+                s_capturedWorldPose.m[row][3] += s_tipOffsetX * s_bgWorldPose.m[row][0]
+                                               + s_tipOffsetY * s_bgWorldPose.m[row][1];
             }
-        }
-        if (!gotPose && s_hasLastKnownPose) {
-            hmd = s_lastKnownPose;
-            gotPose = true;
-        }
 
-        if (gotPose) {
-            // Extract HMD forward direction (yaw only, ignore pitch/roll)
-            float fwdX = -hmd.m[0][2];
-            float fwdZ = -hmd.m[2][2];
-            float len = std::sqrt(fwdX * fwdX + fwdZ * fwdZ);
-            if (len > 0.001f) { fwdX /= len; fwdZ /= len; }
-
-            // Build base rotation facing the HMD (same logic as bg overlay)
-            float base[3][3] = {
-                { -fwdZ, 0.0f, -fwdX },
-                {  0.0f, 1.0f,  0.0f },
-                {  fwdX, 0.0f, -fwdZ }
-            };
-
-            // Final rotation = base * localRotation
-            HmdMatrix34 pose = {};
-            for (int r = 0; r < 3; r++)
-                for (int c = 0; c < 3; c++) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < 3; k++)
-                        sum += base[r][k] * lr[k][c];
-                    pose.m[r][c] = sum;
+            // Apply yaw (around local Y) then pitch (around local X) if non-zero
+            if (std::abs(s_tipYawDeg) > 0.01f) {
+                float yawRad = s_tipYawDeg * 3.14159265f / 180.0f;
+                float cosY = std::cos(yawRad);
+                float sinY = std::sin(yawRad);
+                for (int row = 0; row < 3; row++) {
+                    float rt = s_capturedWorldPose.m[row][0];
+                    float zn = s_capturedWorldPose.m[row][2];
+                    s_capturedWorldPose.m[row][0] = cosY * rt - sinY * zn;
+                    s_capturedWorldPose.m[row][2] = sinY * rt + cosY * zn;
                 }
+            }
+            if (std::abs(s_tipPitchDeg) > 0.01f) {
+                float pitchRad = s_tipPitchDeg * 3.14159265f / 180.0f;
+                float cosP = std::cos(pitchRad);
+                float sinP = std::sin(pitchRad);
+                for (int row = 0; row < 3; row++) {
+                    float up = s_capturedWorldPose.m[row][1];
+                    float zn = s_capturedWorldPose.m[row][2];
+                    s_capturedWorldPose.m[row][1] = cosP * up + sinP * zn;
+                    s_capturedWorldPose.m[row][2] = -sinP * up + cosP * zn;
+                }
+            }
 
-            // Position: in front of HMD, then apply offsets
-            float distance = 6.0f;  // slightly closer than background (7m)
-            pose.m[0][3] = hmd.m[0][3] + fwdX * distance;
-            pose.m[1][3] = hmd.m[1][3] + s_tipOffsetY;
-            pose.m[2][3] = hmd.m[2][3] + fwdZ * distance;
-
-            // Shift horizontally along overlay's local X (negative = left)
-            pose.m[0][3] += s_tipOffsetX * (-fwdZ);  // local X = right = [-fwdZ, 0, fwdX]
-            pose.m[2][3] += s_tipOffsetX * fwdX;
-
-            s_capturedWorldPose = pose;
             s_capturedOverlayActive = true;
-            s_ovrSetTransformAbs(s_overlay, s_capturedOverlayHandle, 1, &pose);
+            s_ovrSetTransformAbs(s_overlay, s_capturedOverlayHandle, 1, &s_capturedWorldPose);
         } else {
-            // Device-relative fallback
+            // Fallback: device-relative
             s_capturedOverlayActive = false;
             HmdMatrix34 devRel = {};
-            for (int r = 0; r < 3; r++)
-                for (int c = 0; c < 3; c++)
-                    devRel.m[r][c] = lr[r][c];
-            devRel.m[0][3] = s_tipOffsetX;
-            devRel.m[1][3] = s_tipOffsetY;
-            devRel.m[2][3] = -2.0f;
+            devRel.m[0][0] = 1.0f;
+            devRel.m[1][1] = 1.0f;
+            devRel.m[2][2] = 1.0f;
+            devRel.m[2][3] = -6.0f;
             s_ovrSetTransformDevRel(s_overlay, s_capturedOverlayHandle, 0, &devRel);
         }
 
         s_ovrShow(s_overlay, s_capturedOverlayHandle);
-        logger::info("VROverlay: captured overlay shown ({}m wide, HMD-pose-based)", width);
+        logger::info("VROverlay: captured overlay shown ({}m wide, aligned to bg)", width);
     }
 
     void VRCompositorHelper::HideCapturedFrameOverlay()
