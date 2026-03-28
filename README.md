@@ -1,22 +1,23 @@
-# VR Loading Screens
+# Faster Loadscreens
 
-A Fallout 4 VR mod that replaces the default loading screens with custom concept art backgrounds and preserves the game's loading tips and level progress display as a floating VR overlay.
+A universal Fallout 4 mod that speeds up loading screens and displays custom concept art backgrounds with the game's loading tips. Works on **VR**, **OG** (1.10.163), **NG** (1.10.980/984), and **AE** (1.11.191).
 
 ## Features
 
-- **Custom background images** — Random DDS artwork shown as a VR overlay during loading (from `Data/Textures/LoadingScreens/`)
-- **Tip & level display** — Game's loading tip text and level progress captured and shown as a transparent floating panel
-- **Loading speed optimization** — Breaks the animation loop sleep so loading runs at full CPU speed
-- **MCM VR settings** — Choose between three modes:
-  - **Black (fastest)** — Plain black screen, no overlays
+- **Custom background images** — Random DDS artwork shown during loading (from `Data/Textures/LoadingScreens/`)
+- **Loading speed optimization** — Breaks the animation loop so loading runs at full CPU speed
+- **Three loading screen modes** (configurable via MCM):
+  - **Black (fastest)** — Plain black screen, no rendering
   - **Background only** — Random concept art image
-  - **Background + Tips** — Art plus floating tip/level text (default)
+  - **Background + Tips** — Art with game's loading tips and level progress (default)
+- **VR support** — World-locked overlays with captured tip display
+- **Performance patches** — VSync disable during loading, PresentThread yield, iFPSClamp bypass
 
 ## Requirements
 
-- [Fallout 4 VR](https://store.steampowered.com/app/611660/Fallout_4_VR/)
-- [F4SEVR](https://f4se.silverlock.org/) (Fallout 4 Script Extender VR)
-- [MCM VR](https://www.nexusmods.com/fallout4/mods/21497) (Mod Configuration Menu VR) — for the in-game settings menu
+- Fallout 4 (any version: VR, OG, NG, or AE)
+- [F4SE](https://f4se.silverlock.org/) matching your game version
+- [Address Library](https://www.nexusmods.com/fallout4/mods/47327) for your game version
 
 ## Installation
 
@@ -24,7 +25,7 @@ Install with your mod manager of choice (Mod Organizer 2 recommended). The mod f
 
 ```
 Data/
-  F4SE/Plugins/VRLoadingScreens.dll
+  F4SE/Plugins/LoadingScreens.dll
   MCM/Config/VRLoadingScreens/config.json
   MCM/Config/VRLoadingScreens/settings.ini
   Textures/LoadingScreens/*.DDS
@@ -38,22 +39,14 @@ Requires:
 - Visual Studio 2022
 - CMake 3.23+
 - vcpkg (`VCPKG_ROOT` environment variable set)
-- [F4VRCommonFramework](https://github.com/rollingrock/F4VRCommonFramework) (set path in CMakeLists.txt)
+- [CommonLibF4](https://github.com/alandtse/CommonLibF4) (alandtse fork with VR/NG support)
 
 ```powershell
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake -B build -S .
 cmake --build build --config Release
 ```
 
 Output DLL is copied to `package/Data/F4SE/Plugins/`.
-
-## Technical Details
-
-- Uses OpenVR IVROverlay API for VR overlay rendering
-- Alpha-key shader strips black background from captured loading screen frame
-- Frame capture crops top 55% of left eye to exclude VR controller models
-- World-locked overlays positioned using HMD pose at capture time
-- Deferred NOP applied inside VR Submit hook for safe animation loop exit
 
 ## License
 
