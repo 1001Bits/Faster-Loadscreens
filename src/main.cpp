@@ -453,7 +453,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 F4SE_EXPORT constinit auto F4SEPlugin_Version = []() noexcept {
     F4SE::PluginVersionData v{};
     v.PluginName("LoadingScreens");
-    v.PluginVersion({ 1, 4, 0, 0 });
+    v.PluginVersion({ 1, 5, 0, 0 });
     v.UsesAddressLibrary(true);
     v.HasNoStructUse(true);
     v.CompatibleVersions({ { 1, 10, 163, 0 }, { 1, 10, 980, 0 }, { 1, 10, 984, 0 }, { 1, 11, 191, 0 } });
