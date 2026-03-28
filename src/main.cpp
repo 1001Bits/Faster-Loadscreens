@@ -12,13 +12,14 @@ using namespace VRLoadingScreens;
 namespace
 {
     // MCM config paths
-    static const char* MCM_CONFIG_INI = "Data\\MCM\\Config\\VRLoadingScreens\\settings.ini";
-    static const char* MCM_USER_INI = "Data\\MCM\\Settings\\VRLoadingScreens.ini";
+    static const char* MCM_CONFIG_INI = "Data\\MCM\\Config\\FasterLoadscreens\\settings.ini";
+    static const char* MCM_USER_INI = "Data\\MCM\\Settings\\FasterLoadscreens.ini";
 
     // Config
     struct Config
     {
-        int loadingScreenMode = 2;
+        // 0=Black, 1=Native (no 3D model), 2=Background only, 3=Background+Tips
+        int loadingScreenMode = 3;
         bool enableBackgroundImages = true;
         bool showTipDisplay = true;
         float renderDelaySeconds = 0.5f;
@@ -53,12 +54,13 @@ namespace
             }
 
             loadingScreenMode = static_cast<int>(ini.GetLongValue(
-                "Main", "iLoadingScreenMode", 2));
+                "Main", "iLoadingScreenMode", 3));
             benchmarkMode = static_cast<int>(ini.GetLongValue(
                 "Main", "iBenchmarkMode", 1));
 
-            enableBackgroundImages = (loadingScreenMode >= 1);
-            showTipDisplay = (loadingScreenMode >= 2);
+            // 0=Black, 1=Native (no 3D), 2=BG only, 3=BG+Tips
+            enableBackgroundImages = (loadingScreenMode >= 2);
+            showTipDisplay = (loadingScreenMode >= 3);
             renderDelaySeconds = showTipDisplay ? 0.5f : 0.0f;
 
             backgroundWidth = static_cast<float>(ini.GetDoubleValue(
@@ -121,9 +123,16 @@ namespace
                 if (a_event.opening) {
                     m_loadCount++;
                     m_loadStart = std::chrono::steady_clock::now();
-                    logger::info("LoadingMenu OPEN (load #{})", m_loadCount);
 
-                    // Flat only: compositor enable/disable (reference VR code doesn't use this)
+                    // Re-read MCM settings so changes apply immediately
+                    g_config.Load();
+                    auto& lsm = LoadingScreenManager::GetSingleton();
+                    lsm.SetBackgroundsEnabled(g_config.enableBackgroundImages);
+                    lsm.SetRenderDelay(g_config.renderDelaySeconds);
+                    D3D11Compositor::GetSingleton().SetFlatMode(g_config.loadingScreenMode);
+
+                    logger::info("LoadingMenu OPEN (load #{}, mode={})", m_loadCount, g_config.loadingScreenMode);
+
                     if (!g_isVR) {
                         D3D11Compositor::GetSingleton().SetEnabled(true);
                     }
@@ -355,6 +364,7 @@ namespace
         lsm.SetBackgroundsEnabled(g_config.enableBackgroundImages);
         lsm.SetRenderDelay(g_config.renderDelaySeconds);
         lsm.SetOverlayAlpha(g_config.overlayAlpha);
+        D3D11Compositor::GetSingleton().SetFlatMode(g_config.loadingScreenMode);
 
         if (g_isVR) {
             g_pendingTimerPatches = true;
@@ -437,8 +447,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 
     F4SE::Init(a_f4se);
 
-    spdlog::set_level(spdlog::level::info);
-    spdlog::flush_every(std::chrono::seconds(1));
+    spdlog::set_level(spdlog::level::warn);
 
     auto messaging = F4SE::GetMessagingInterface();
     if (messaging) {

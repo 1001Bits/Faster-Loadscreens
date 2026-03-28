@@ -26,8 +26,8 @@ Install with your mod manager of choice (Mod Organizer 2 recommended). The mod f
 ```
 Data/
   F4SE/Plugins/LoadingScreens.dll
-  MCM/Config/VRLoadingScreens/config.json
-  MCM/Config/VRLoadingScreens/settings.ini
+  MCM/Config/FasterLoadscreens/config.json
+  MCM/Config/FasterLoadscreens/settings.ini
   Textures/LoadingScreens/*.DDS
 ```
 

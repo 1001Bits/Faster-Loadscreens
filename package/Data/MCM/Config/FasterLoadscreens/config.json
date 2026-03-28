@@ -1,6 +1,6 @@
 {
-    "modName": "VRLoadingScreens",
-    "displayName": "VR Loading Screens",
+    "modName": "FasterLoadscreens",
+    "displayName": "Faster Loadscreens",
     "minMcmVersion": 1,
     "content": [
         {
@@ -14,10 +14,10 @@
             "id": "iLoadingScreenMode:Main",
             "text": "Loading screen mode",
             "type": "stepper",
-            "help": "Black: fastest loading, plain black screen. Background: shows a random concept art image. Background + Tips: also shows the loading tip and level progress.",
+            "help": "Choose what to display during loading screens.",
             "valueOptions": {
                 "sourceType": "ModSettingInt",
-                "options": ["Black (fastest)", "Background only", "Background + Tips"]
+                "options": ["Black screen", "Native (no 3D)", "Background", "Background + Tips"]
             }
         }
     ]

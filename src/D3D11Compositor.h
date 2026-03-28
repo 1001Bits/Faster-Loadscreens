@@ -40,6 +40,8 @@ namespace VRLoadingScreens
 
         // Flat loading screen mode: 0=blank, 1=background only, 2=background+tips
         void SetFlatMode(int mode) { m_flatMode = mode; }
+        int GetFlatMode() const { return m_flatMode; }
+        void KillAdvanceMovie();  // Block loading screen rendering immediately
 
         // Whether to capture and show the tip+level overlay
         void SetShowCapturedOverlay(bool show) { m_showCapturedOverlay = show; }

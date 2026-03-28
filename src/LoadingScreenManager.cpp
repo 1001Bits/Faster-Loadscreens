@@ -188,13 +188,18 @@ namespace VRLoadingScreens
         }
 
         if (!m_isVR) {
-            // Flat: enable compositor (handles AdvanceMovie kill + background compositing)
             auto& comp = D3D11Compositor::GetSingleton();
+            // Mode 0: kill AdvanceMovie early → black screen, no GPU rendering
+            // Mode 1: native loading screen (no 3D model, tips still render)
+            // Mode 2/3: our compositor handles rendering
+            if (comp.GetFlatMode() == 0) {
+                comp.KillAdvanceMovie();
+            }
             if (m_backgroundsEnabled && m_currentBgTexture) {
                 comp.SetBackgroundTexture(m_currentBgTexture);
             }
             comp.SetEnabled(true);
-            logger::info("Flat: compositor enabled (mode={})", m_backgroundsEnabled ? "bg" : "blank");
+            logger::info("Flat: compositor enabled (flatMode={})", comp.GetFlatMode());
         }
     }
 

@@ -478,12 +478,13 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             }
 
             if (self->m_enabled) {
-                // Mode 0 (Blank): kill AdvanceMovie immediately, no compositing
-                // Mode 1 (BG only): kill AdvanceMovie immediately, composite background-only
-                // Mode 2 (BG+tips): luminance key for 5 frames, then kill AdvanceMovie + switch to bg-only
+                // Mode 0 (Blank): killed early in OnLoadingMenuOpen
+                // Mode 1 (Native): no kill — game renders tips/spinner natively
+                // Mode 2 (BG only): kill immediately, composite background-only
+                // Mode 3 (BG+tips): luminance key for 5 frames, then kill + switch to bg-only
                 if (!self->m_advanceMovieKilled && !self->m_isVR && !REL::Module::IsNG()) {
-                    bool killNow = (self->m_flatMode <= 1) ||
-                                   (self->m_flatMode == 2 && self->m_flatPresentCount >= 5);
+                    bool killNow = (self->m_flatMode == 2) ||
+                                   (self->m_flatMode == 3 && self->m_flatPresentCount >= 5);
                     if (killNow) {
                         try {
                             static constexpr std::uint8_t RET = 0xC3;
@@ -499,8 +500,8 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                     }
                 }
 
-                // Composite: mode 0 = nothing, mode 1/2 = background (with or without luminance key)
-                if (self->m_flatMode > 0 && self->m_bgSRV) {
+                // Composite: mode 0 = black, mode 1 = nothing (native), mode 2/3 = background
+                if (self->m_flatMode == 0 || (self->m_flatMode >= 2 && self->m_bgSRV)) {
                     auto* sc = static_cast<IDXGISwapChain*>(swapChain);
                     ID3D11Texture2D* backbuffer = nullptr;
                     HRESULT hr = sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer));
@@ -525,7 +526,28 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
     void D3D11Compositor::CompositeFlatFrame(void* backbufferTex)
     {
-        if (!m_context || !backbufferTex || !m_bgSRV) return;
+        if (!m_context || !backbufferTex) return;
+
+        // Mode 0: clear to black (overwrite game's loading screen rendering)
+        if (m_flatMode == 0) {
+            auto* ctx = static_cast<ID3D11DeviceContext*>(m_context);
+            auto* device = static_cast<ID3D11Device*>(m_device);
+            auto* bbTex = static_cast<ID3D11Texture2D*>(backbufferTex);
+            D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+            D3D11_TEXTURE2D_DESC bbDesc;
+            bbTex->GetDesc(&bbDesc);
+            rtvDesc.Format = bbDesc.Format;
+            rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            ID3D11RenderTargetView* rtv = nullptr;
+            if (SUCCEEDED(device->CreateRenderTargetView(bbTex, &rtvDesc, &rtv)) && rtv) {
+                float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                ctx->ClearRenderTargetView(rtv, black);
+                rtv->Release();
+            }
+            return;
+        }
+
+        if (!m_bgSRV) return;
 
         auto* ctx = static_cast<ID3D11DeviceContext*>(m_context);
         auto* device = static_cast<ID3D11Device*>(m_device);
@@ -534,9 +556,9 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         D3D11_TEXTURE2D_DESC bbDesc;
         bbTex->GetDesc(&bbDesc);
 
-        // Mode 1 or after AdvanceMovie kill: background only (no luminance key)
-        // Mode 2 before kill: luminance key (game tips composited over background)
-        bool backgroundOnly = m_flatBackgroundOnly || (m_flatMode == 1);
+        // Mode 2 or after AdvanceMovie kill: background only (no luminance key)
+        // Mode 3 before kill: luminance key (game tips composited over background)
+        bool backgroundOnly = m_flatBackgroundOnly || (m_flatMode == 2);
 
         if (!backgroundOnly) {
             // Copy backbuffer to temp texture (game's loading screen content)
@@ -896,7 +918,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             m_submitCompositeCount = 0;
             m_flatPresentCount = 0;
             m_skipPresent = false;
-            m_flatBackgroundOnly = (m_flatMode == 1);  // mode 1 starts in bg-only
+            m_flatBackgroundOnly = (m_flatMode == 2);  // mode 2 starts in bg-only
 
             m_compositeParams.threshold = 0.25f;
             m_compositeParams.bgUvScaleX = 1.0f;
@@ -908,6 +930,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 m_ngLoadNumber++;
             }
         } else {
+            m_flatBackgroundOnly = false;
             // Restore AdvanceMovie if we killed it during loading
             if (m_advanceMovieKilled && m_advanceMovieAddr) {
                 REL::safe_write(m_advanceMovieAddr, &m_advanceMovieOrigByte, 1);
@@ -923,6 +946,20 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         }
         m_enabled = enabled;
         logger::info("D3D11Compositor: {}", enabled ? "enabled" : "disabled");
+    }
+
+    void D3D11Compositor::KillAdvanceMovie()
+    {
+        if (m_advanceMovieKilled || m_isVR || REL::Module::IsNG()) return;
+        try {
+            static constexpr std::uint8_t RET = 0xC3;
+            REL::Relocation<std::uintptr_t> advanceMovie{ REL::ID(314582) };
+            m_advanceMovieAddr = advanceMovie.address();
+            m_advanceMovieOrigByte = *reinterpret_cast<std::uint8_t*>(m_advanceMovieAddr);
+            REL::safe_write(m_advanceMovieAddr, &RET, 1);
+            m_advanceMovieKilled = true;
+            logger::info("OG: AdvanceMovie killed early at {:x}", m_advanceMovieAddr);
+        } catch (...) {}
     }
 
     // ========================================================================
