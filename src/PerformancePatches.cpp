@@ -39,19 +39,18 @@ namespace VRLoadingScreens
                 REL::safe_write(target.address(), NOP5, sizeof(NOP5));
                 logger::info("VR: DisableAnimation NOP5 at {:x}", target.address());
             } else if (isNG) {
-                // NG: NOP5 the animation loop instruction inside the loading screen function
-                // Same approach as High FPS Physics Fix: REL::ID(2227631) + 0x223
-                // This is NOT a function hook — it patches a specific instruction that may be
-                // reached through inlining or mid-function jumps, not the normal entry point.
-                try {
-                    REL::Relocation<std::uintptr_t> loadingFunc{ REL::ID(DisableAnimation_ID_NG) };
-                    auto patchAddr = loadingFunc.address() + DisableAnimation_Offset_NG;
-                    REL::safe_write(patchAddr, NOP5, sizeof(NOP5));
-                    logger::info("NG: DisableAnimation NOP5 at {:x} (ID {} + {:x})",
-                        patchAddr, DisableAnimation_ID_NG, DisableAnimation_Offset_NG);
-                } catch (...) {
-                    logger::warn("NG: DisableAnimation ID {} not found", DisableAnimation_ID_NG);
-                }
+                // NG/AE: NOP5 the animation instruction (same as HFPF)
+                [&]() {
+                    __try {
+                        REL::Relocation<std::uintptr_t> loadingFunc{ REL::ID(DisableAnimation_ID_NG) };
+                        auto patchAddr = loadingFunc.address() + DisableAnimation_Offset_NG;
+                        REL::safe_write(patchAddr, NOP5, sizeof(NOP5));
+                        logger::info("NG: DisableAnimation NOP5 at {:x} (ID {} + {:x})",
+                            patchAddr, DisableAnimation_ID_NG, DisableAnimation_Offset_NG);
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {
+                        logger::warn("NG: DisableAnimation patch failed (access violation)");
+                    }
+                }();
             } else {
                 // OG flat: RET InitModel only (no 3D model, tips still render)
                 // Dynamic animation loop NOP in LoadingScreenManager handles speed
@@ -67,9 +66,15 @@ namespace VRLoadingScreens
         // ================================================================
         if (config.disableBlackLoadingScreens) {
             if (isNG) {
-                REL::Relocation<std::uintptr_t> target{ REL::ID(DisableBlackLoading_ID_NG) };
-                REL::safe_write(target.address() + DisableBlackLoading_Offset_NG, JMP_SHORT, sizeof(JMP_SHORT));
-                logger::info("NG: DisableBlackLoadingScreens at {:x}+{:x}", target.address(), DisableBlackLoading_Offset_NG);
+                [&]() {
+                    __try {
+                        REL::Relocation<std::uintptr_t> target{ REL::ID(DisableBlackLoading_ID_NG) };
+                        REL::safe_write(target.address() + DisableBlackLoading_Offset_NG, JMP_SHORT, sizeof(JMP_SHORT));
+                        logger::info("NG: DisableBlackLoadingScreens at {:x}+{:x}", target.address(), DisableBlackLoading_Offset_NG);
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {
+                        logger::warn("NG: DisableBlackLoadingScreens patch failed (access violation)");
+                    }
+                }();
             } else {
                 REL::Relocation<std::uintptr_t> target{ REL::Offset(DisableBlackLoadingScreens_Offset_OG) };
                 REL::safe_write(target.address(), JMP_SHORT, sizeof(JMP_SHORT));
@@ -110,15 +115,19 @@ namespace VRLoadingScreens
         // ================================================================
         // iFPSClamp disable
         // ================================================================
-        if (config.disableiFPSClamp) {
-            try {
-                if (auto* setting = RE::GetINISetting("iFPSClamp:General")) {
-                    setting->SetInt(0);
-                    logger::info("iFPSClamp:General set to 0");
+        if (config.disableiFPSClamp && !isNG) {
+            // RE::GetINISetting crashes on NG 1.11.191 (internal -1 sentinel pointer)
+            // VR/OG only — NG doesn't need this (HFPF handles it, or it's not relevant)
+            [&]() {
+                __try {
+                    if (auto* setting = RE::GetINISetting("iFPSClamp:General")) {
+                        setting->SetInt(0);
+                        logger::info("iFPSClamp:General set to 0");
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    logger::warn("iFPSClamp disable skipped (access violation)");
                 }
-            } catch (...) {
-                logger::warn("iFPSClamp disable skipped (address library unavailable)");
-            }
+            }();
         }
 
         // ================================================================
@@ -142,18 +151,23 @@ namespace VRLoadingScreens
         // PresentThread — NOP the blocking wait to reduce CPU waste
         // Sleep(1) on PresentThread causes deadlock on OG (threads are interdependent)
         if (config.yieldCPUDuringLoading && !isVR) {
-            try {
-                auto ptId = isNG ? PresentThread_ID_NG : PresentThread_ID_OG;
-                REL::Relocation<std::uintptr_t> pt{ REL::ID(ptId) };
-                auto ptAddr = pt.address();
+            [&]() {
+                __try {
+                    auto ptId = isNG ? PresentThread_ID_NG : PresentThread_ID_OG;
+                    REL::Relocation<std::uintptr_t> pt{ REL::ID(ptId) };
+                    auto ptAddr = pt.address();
 
-                static constexpr std::uint8_t NOP10[] = { 0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90 };
-                REL::safe_write(ptAddr + PresentThread_BlockWait_Offset, NOP10, sizeof(NOP10));
-                logger::info("PresentThread NOP at {:x}+{:x}", ptAddr, PresentThread_BlockWait_Offset);
-            } catch (...) {
-                logger::warn("PresentThread patch failed");
-            }
+                    static constexpr std::uint8_t NOP10[] = { 0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90 };
+                    REL::safe_write(ptAddr + PresentThread_BlockWait_Offset, NOP10, sizeof(NOP10));
+                    logger::info("PresentThread NOP at {:x}+{:x}", ptAddr, PresentThread_BlockWait_Offset);
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    logger::warn("PresentThread patch failed (access violation)");
+                }
+            }();
         }
+
+        // NG/AE: no MinHook hooks — loading detection uses kPreLoadGame/kPostLoadGame.
+        // DisableAnimation NOP5 handles speed, no need to hook AdvanceMovie/InitModel.
 
         logger::info("Performance patches applied (VR={}, NG={}, cpuYield={})", isVR, isNG, s_yieldEnabled);
     }
@@ -286,12 +300,14 @@ namespace VRLoadingScreens
             s_ngLoadCount++;
             logger::info("NG: loading started (load #{})", s_ngLoadCount);
             OnLoadingMenuOpen();
+            if (s_ngOnOpen) s_ngOnOpen();
         } else if (!recentActivity && wasActive) {
             // Loading ended
             s_ngLoadingActive = false;
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - s_loadStartTime).count();
             logger::info("NG: loading ended (load #{}, {:.2f}s)", s_ngLoadCount, elapsed / 1000.0);
+            if (s_ngOnClose) s_ngOnClose();
             OnLoadingMenuClose();
         }
     }

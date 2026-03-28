@@ -94,6 +94,10 @@ namespace
     // Forward declarations
     static bool s_hfpfDetected = false;
     static bool s_pendingGameSessionLoaded = false;
+    static bool s_ngMenuEventsRegistered = false;
+    static std::chrono::steady_clock::time_point s_ngLastPostLoadTime{};
+    static bool s_ngLoadingActive = false;
+    static bool s_ngHeaderReadPending = false;  // true after first kPreLoadGame, cleared by immediate kPostLoadGame
     void OnGameSessionLoaded();
 
     // ========================================================================
@@ -190,52 +194,10 @@ namespace
     // D3D11 device acquisition and Present hook installation
     // ========================================================================
 
-    // NG: RE::UI singleton found via Ghidra RTTI chain:
-    //   UI type_info → COL → vtable 0x1427159d8 → constructor FUN_141a7f600 → DAT_1430dd830
-    //   RVA 0x30dd830 holds the UI* pointer (set in constructor: DAT_1430dd830 = param_1)
-    //   Address library ID 2689028 is WRONG (maps to RVA 0x3296170, unrelated struct data)
-    static constexpr std::uintptr_t NG_UI_SINGLETON_RVA = 0x030dd830;
-
-    static bool TryReadPointer_SEH(std::uintptr_t addr, void** outValue)
-    {
-        __try {
-            *outValue = *reinterpret_cast<void**>(addr);
-            return true;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            *outValue = nullptr;
-            return false;
-        }
-    }
-
-    static bool s_ngMenuEventsRegistered = false;
-
-    void TryRegisterNGMenuEvents()
-    {
-        if (s_ngMenuEventsRegistered) return;
-
-        auto base = REL::Module::get().base();
-        auto uiPtrAddr = base + NG_UI_SINGLETON_RVA;
-
-        void* uiPtr = nullptr;
-        if (!TryReadPointer_SEH(uiPtrAddr, &uiPtr) || !uiPtr) {
-            logger::info("NG: UI singleton at {:x} not yet initialized", uiPtrAddr);
-            return;
-        }
-
-        logger::info("NG: UI singleton = {:x}", reinterpret_cast<std::uintptr_t>(uiPtr));
-
-        // Cast to RE::UI* and register for MenuOpenCloseEvent
-        auto* ui = reinterpret_cast<RE::UI*>(uiPtr);
-        try {
-            ui->GetEventSource<RE::MenuOpenCloseEvent>()->RegisterSink(
-                MenuWatcher::GetSingleton());
-            s_ngMenuEventsRegistered = true;
-            D3D11Compositor::GetSingleton().SetMenuEventsActive(true);
-            logger::info("NG: Registered for MenuOpenCloseEvent");
-        } catch (...) {
-            logger::warn("NG: MenuOpenCloseEvent registration failed");
-        }
-    }
+    // NG/AE loading detection:
+    // - NG 1.10.x: RE::UI::GetSingleton() works (ID 2689028 correct) → register at init
+    // - AE 1.11.x: RegisterSink deadlocks from any thread except during init → use kPreLoadGame fallback
+    //   kPreLoadGame + 1s delay → enable, kPostLoadGame + 3s delay → disable
 
     // ========================================================================
     // Initialization — called when game data is ready
@@ -375,7 +337,9 @@ namespace
                 logger::warn("Menu event registration failed");
             }
         } else {
-            logger::info("NG: menu events deferred to first game session");
+            // NG/AE: RE::UI::GetSingleton() broken in CROSS_VR build (wrong ID).
+            // Use kPreLoadGame/kPostLoadGame for loading detection.
+            logger::info("NG/AE: using kPreLoadGame/kPostLoadGame detection");
         }
 
         logger::info("LoadingScreens initialized (VR={})", g_isVR);
@@ -385,11 +349,6 @@ namespace
     {
         g_gameSessionLoaded = true;
         g_config.Load();  // re-read MCM settings
-
-        // NG: retry menu event registration if not done yet
-        if (REL::Module::IsNG()) {
-            TryRegisterNGMenuEvents();
-        }
 
         auto& lsm = LoadingScreenManager::GetSingleton();
         lsm.SetGameSessionLoaded();
@@ -424,23 +383,32 @@ namespace
             break;
         case F4SE::MessagingInterface::kPreLoadGame:
             logger::info("kPreLoadGame received");
-            // NG without menu events: enable compositor as backup
-            if (REL::Module::IsNG() && !s_ngMenuEventsRegistered) {
-                logger::info("NG: kPreLoadGame — enabling compositor (no menu events)");
+            // NG/AE: enable compositor on kPreLoadGame
+            if (REL::Module::IsNG() && !s_ngMenuEventsRegistered && !s_ngLoadingActive) {
+                s_ngLoadingActive = true;
                 D3D11Compositor::GetSingleton().SetEnabled(true);
                 LoadingScreenManager::GetSingleton().OnLoadingMenuOpen();
                 PerformancePatches::OnLoadingMenuOpen();
+                logger::info("NG: loading started (kPreLoadGame)");
             }
+
             break;
         case F4SE::MessagingInterface::kPostLoadGame:
             logger::info("kPostLoadGame received");
-            // VR: always defer to MenuWatcher close handler — the F4SE messaging
-            // thread fires kPostLoadGame at unsafe times (before/during loading screen).
-            // The reference code's framework handles this by calling onGameSessionLoaded
-            // from a safe frame update context, not the messaging thread.
             if (g_isVR) {
                 s_pendingGameSessionLoaded = true;
                 logger::info("VR: kPostLoadGame deferred to menu close");
+            } else if (REL::Module::IsNG()) {
+                s_ngLastPostLoadTime = std::chrono::steady_clock::now();
+                // Close loading if active
+                if (s_ngLoadingActive) {
+                    s_ngLoadingActive = false;
+                    D3D11Compositor::GetSingleton().SetEnabled(false);
+                    LoadingScreenManager::GetSingleton().OnLoadingMenuClose();
+                    PerformancePatches::OnLoadingMenuClose();
+                    logger::info("NG: loading ended (kPostLoadGame)");
+                }
+                OnGameSessionLoaded();
             } else {
                 OnGameSessionLoaded();
             }
@@ -469,7 +437,8 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 
     F4SE::Init(a_f4se);
 
-    spdlog::set_level(spdlog::level::warn);
+    spdlog::set_level(spdlog::level::info);
+    spdlog::flush_every(std::chrono::seconds(1));
 
     auto messaging = F4SE::GetMessagingInterface();
     if (messaging) {

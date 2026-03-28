@@ -23,6 +23,14 @@ namespace VRLoadingScreens
         static void OnLoadingMenuClose();
         static void OnPresent();
 
+        // NG/AE: loading state change callbacks (called when AdvanceMovie detection triggers)
+        using NGLoadingCallback = void(*)();
+        static void SetNGLoadingCallbacks(NGLoadingCallback onOpen, NGLoadingCallback onClose)
+        {
+            s_ngOnOpen = onOpen;
+            s_ngOnClose = onClose;
+        }
+
         // NG: check if loading screen is active (based on AdvanceMovie hook)
         static bool IsNGLoadingActive();
         static void UpdateNGLoadingState();
@@ -92,5 +100,8 @@ namespace VRLoadingScreens
         static inline bool s_oneThreadEnabled = false;
         static inline DWORD_PTR s_normalAffinityMask = 0;
 
+        // NG loading state change callbacks
+        static inline NGLoadingCallback s_ngOnOpen = nullptr;
+        static inline NGLoadingCallback s_ngOnClose = nullptr;
     };
 }

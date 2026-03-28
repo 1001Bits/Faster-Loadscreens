@@ -370,12 +370,18 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         ID3D11Device* dev = nullptr;
         sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev));
         if (!dev) {
-            logger::error("D3D11Compositor: CompleteFlatInit failed — no device from swapchain");
-            return false;
+            // Fallback: get device from RendererData (works if swapchain is wrapped by another mod)
+            logger::warn("D3D11Compositor: GetDevice from swapchain failed, trying RendererData");
+            if (!TryGetDeviceFromRendererData()) {
+                logger::error("D3D11Compositor: CompleteFlatInit failed — no device");
+                return false;
+            }
+            dev = static_cast<ID3D11Device*>(m_device);
+            // m_swapChain already set by TryGetDeviceFromRendererData
+        } else {
+            m_device = dev;
+            m_swapChain = swapChain;
         }
-
-        m_device = dev;
-        m_swapChain = swapChain;
 
         // Also give the device to VRCompositorHelper for DDS texture loading
         VRCompositorHelper::SetDevice(reinterpret_cast<REX::W32::ID3D11Device*>(dev));
