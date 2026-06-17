@@ -2,7 +2,6 @@
 #include "SceneReadyHold.h"
 #include "Config.h"
 #include "LoadingLoopHook.h"
-#include "PatternScan.h"
 
 #include "RE/E/ExtraCellGrassData.h"
 
@@ -30,21 +29,16 @@ namespace FasterLoadscreens
         // promoting queued references — exactly the work that finishes the scene.
         using ShowHideFn = std::uint64_t (*)(char, void*, std::uint8_t, char);
 
-        // Verified-unique 35-byte prologue on AE 1.6.1170 (RVA 0x1A1150); SE
-        // 1.5.97 (RVA 0x157710) shares it. VR 1.4.15's prologue differs (different
-        // register allocation) — resolve VR via the Address Library instead.
-        //   push rdi/r14/r15 ; sub rsp,0x40 ; mov [rsp+38],-2 ; save rbx/rbp/rsi
-        constexpr const char* SIG_SHOWHIDE_FLAT =
-            "40 57 41 56 41 57 48 83 EC 40 48 C7 44 24 38 FE FF FF FF "
-            "48 89 5C 24 68 48 89 6C 24 70 48 89 74 24 78";
-
+        // ShowHideLoadingMenu — hardcoded RVAs per verified runtime (no scan, no
+        // Address Library). Unrecognized build → feature off (this is the
+        // experimental, off-by-default scene-ready hold anyway).
         struct KnownRVA
         {
             std::uint16_t major, minor, patch;
             std::uint32_t rva;
         };
         constexpr KnownRVA KNOWN_FLAT[] = {
-            { 1, 5, 97, 0x157710 },    // SE 1.5.97
+            { 1, 5, 97,   0x157710 },  // SE 1.5.97
             { 1, 6, 1170, 0x1A1150 },  // AE 1.6.1170
         };
 
@@ -56,7 +50,6 @@ namespace FasterLoadscreens
         };
 
         ShowHideFn s_origShowHide = nullptr;
-        bool s_isVR = false;
 
         std::atomic<bool> s_running{ false };
         std::atomic<bool> s_tickQueued{ false };
@@ -286,44 +279,15 @@ namespace FasterLoadscreens
         std::uintptr_t ResolveShowHide()
         {
             const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
-            const auto pat = scan::Parse(SIG_SHOWHIDE_FLAT);
-
-            if (!s_isVR) {
-                // Flat (SE/AE/unknown): known RVA + prologue verify, then a unique
-                // signature scan. No Address Library dependency, so an unknown
-                // flat patch degrades to "feature off" rather than crashing.
-                const auto ver = REL::Module::get().version();
-                for (const auto& k : KNOWN_FLAT) {
-                    if (ver[0] == k.major && ver[1] == k.minor && ver[2] == k.patch) {
-                        const auto addr = base + k.rva;
-                        if (scan::MatchAt(reinterpret_cast<const std::uint8_t*>(addr), pat)) {
-                            logger::info("SceneReadyHold: ShowHideLoadingMenu via known RVA {:x}", k.rva);
-                            return addr;
-                        }
-                        logger::warn("SceneReadyHold: known RVA {:x} prologue mismatch — scanning", k.rva);
-                        break;
-                    }
+            const auto ver = REL::Module::get().version();
+            for (const auto& k : KNOWN_FLAT) {
+                if (ver[0] == k.major && ver[1] == k.minor && ver[2] == k.patch) {
+                    logger::info("SceneReadyHold: ShowHideLoadingMenu via known RVA {:x}", k.rva);
+                    return base + k.rva;
                 }
-                const auto addr = scan::FindUnique(pat, "SceneReadyHold::ShowHideLoadingMenu");
-                if (addr) {
-                    logger::info("SceneReadyHold: ShowHideLoadingMenu via signature at RVA {:x}", addr - base);
-                }
-                return addr;
             }
-
-            // VR 1.4.15: prologue differs from flat, so resolve via the Address
-            // Library (SE id 13214 maps VR; AE id 13363 unused on VR). These are
-            // core engine IDs present in every VR address library.
-            try {
-                REL::Relocation<std::uintptr_t> rel{ REL::RelocationID(13214, 13363) };
-                if (rel.address()) {
-                    logger::info("SceneReadyHold: ShowHideLoadingMenu via Address Library at RVA {:x}",
-                        rel.address() - base);
-                    return rel.address();
-                }
-            } catch (...) {
-                logger::warn("SceneReadyHold: VR Address Library lookup failed");
-            }
+            logger::warn("SceneReadyHold: no known ShowHideLoadingMenu RVA for runtime {}.{}.{} — feature off",
+                ver[0], ver[1], ver[2]);
             return 0;
         }
     }
@@ -340,7 +304,6 @@ namespace FasterLoadscreens
             return false;
         }
 
-        s_isVR = REL::Module::IsVR();
         const auto target = ResolveShowHide();
         if (!target) {
             logger::warn("SceneReadyHold: ShowHideLoadingMenu not resolved — feature off (loads close as before)");

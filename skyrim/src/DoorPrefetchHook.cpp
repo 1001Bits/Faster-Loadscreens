@@ -1,7 +1,6 @@
 #include "PCH.h"
 #include "DoorPrefetchHook.h"
 #include "Config.h"
-#include "PatternScan.h"
 
 #include <Windows.h>
 
@@ -20,32 +19,19 @@ namespace FasterLoadscreens
         // The engine interior-preload forwarder:
         //   void preload(void* /*unused*/, TESObjectCELL* a_cell)
         //   -> CellLoaderManager::QueuePreload(g_manager, a_cell, 1)
-        // It is a 21-byte tail-call forwarder. The pattern below matches a few
-        // sites; the real one is the one whose tail JMP lands on the queue
-        // function (distinctive prologue). Verified on SE 1.5.97 (RVA 0x1584c0),
-        // AE 1.6.1170 (0x1a1fd0) and VR 1.4.15 (0x168f70).
-        //   48 85 D2            test rdx, rdx          (a_cell)
-        //   74 ??               jz  short  (no-op if null)
-        //   48 8B 0D ?? ?? ?? ?? mov rcx, [rip+manager]
-        //   41 B0 01            mov r8b, 1
-        //   E9 ?? ?? ?? ??      jmp queue
-        //   C3                  ret
-        constexpr const char* SIG_FORWARDER =
-            "48 85 D2 74 ?? 48 8B 0D ?? ?? ?? ?? 41 B0 01 E9 ?? ?? ?? ?? C3";
-        // Queue-function prologue, used to disambiguate the forwarder:
-        //   48 85 D2  0F 84 ?? ?? 00 00   55 56 57 41 56 41 57
-        constexpr const char* SIG_QUEUE_PROLOGUE =
-            "48 85 D2 0F 84 ?? ?? 00 00 55 56 57 41 56 41 57";
-
+        // A 21-byte tail-call forwarder; addresses hardcoded per verified runtime
+        // (no scan — an unrecognized build leaves s_preloadCell null and prefetch
+        // is simply off, fail-safe).
         struct KnownRVA
         {
             std::uint16_t major, minor, patch;
             std::uint32_t forwarder;
         };
         constexpr KnownRVA KNOWN[] = {
-            { 1, 5, 97, 0x1584c0 },    // SE 1.5.97
-            { 1, 6, 1170, 0x1a1fd0 },  // AE 1.6.1170
-            { 1, 4, 15, 0x168f70 },    // VR 1.4.15
+            { 1, 5, 97,   0x1584c0 },  // SE 1.5.97
+            { 1, 6, 1170, 0x1a1fd0 },  // AE 1.6.1170 (Steam)
+            { 1, 6, 1179, 0x1a1e00 },  // AE 1.6.1179 (GOG) — Ghidra-verified
+            { 1, 4, 15,   0x168f70 },  // VR 1.4.15
         };
 
         using PreloadCellFn = void (*)(void*, RE::TESObjectCELL*);
@@ -101,6 +87,11 @@ namespace FasterLoadscreens
         // game thread (e.g. mid-load) doesn't accumulate a backlog of polls.
         std::atomic<bool> s_pollQueued{ false };
 
+        // Set when we queue exterior cells via the tracked loader; consumed by
+        // FlushQueuedLoads so it only reconciles the shared loader on transitions
+        // where WE actually queued (never touches the engine's own transition tasks).
+        std::atomic<bool> s_queuedExterior{ false };
+
         // Recently-prefetched cells, by FormID -> last-fire time. A cell isn't
         // re-fired until the cooldown elapses (so staring at a door doesn't spam
         // the loader), but the cooldown also lets an evicted cell be re-warmed.
@@ -110,52 +101,16 @@ namespace FasterLoadscreens
         bool ResolveForwarder()
         {
             const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
-            const auto fwdPat = scan::Parse(SIG_FORWARDER);
-            const auto queuePat = scan::Parse(SIG_QUEUE_PROLOGUE);
-
-            // Confirm a forwarder candidate's tail JMP lands on the queue fn.
-            auto jumpsToQueue = [&](std::uintptr_t addr) -> bool {
-                const auto* p = reinterpret_cast<const std::uint8_t*>(addr);
-                if (p[15] != 0xE9) {
-                    return false;
-                }
-                std::int32_t rel = 0;
-                std::memcpy(&rel, p + 16, sizeof(rel));
-                const auto target = addr + 20 + rel;
-                return scan::MatchAt(reinterpret_cast<const std::uint8_t*>(target), queuePat);
-            };
-
-            // Known-RVA fast path.
             const auto ver = REL::Module::get().version();
             for (const auto& k : KNOWN) {
                 if (ver[0] == k.major && ver[1] == k.minor && ver[2] == k.patch) {
-                    const auto addr = base + k.forwarder;
-                    if (scan::MatchAt(reinterpret_cast<const std::uint8_t*>(addr), fwdPat) &&
-                        jumpsToQueue(addr)) {
-                        s_preloadCell = reinterpret_cast<PreloadCellFn>(addr);
-                        logger::info("DoorPrefetch: preload fn via known RVA {:x}", k.forwarder);
-                        return true;
-                    }
-                    logger::warn("DoorPrefetch: known RVA {:x} didn't validate — scanning", k.forwarder);
-                    break;
+                    s_preloadCell = reinterpret_cast<PreloadCellFn>(base + k.forwarder);
+                    logger::info("DoorPrefetch: preload fn via known RVA {:x}", k.forwarder);
+                    return true;
                 }
             }
-
-            // Signature scan + queue-target disambiguation.
-            std::uintptr_t found = 0;
-            int hits = 0;
-            for (const auto cand : scan::FindAll(fwdPat)) {
-                if (jumpsToQueue(cand)) {
-                    found = cand;
-                    ++hits;
-                }
-            }
-            if (hits == 1) {
-                s_preloadCell = reinterpret_cast<PreloadCellFn>(found);
-                logger::info("DoorPrefetch: preload fn via signature at RVA {:x}", found - base);
-                return true;
-            }
-            logger::warn("DoorPrefetch: preload fn not uniquely resolved ({} candidates) — disabled", hits);
+            logger::warn("DoorPrefetch: no known preload-fn RVA for runtime {}.{}.{} — prefetch disabled",
+                ver[0], ver[1], ver[2]);
             return false;
         }
 
@@ -175,15 +130,11 @@ namespace FasterLoadscreens
             {
                 std::uint16_t major, minor, patch;
                 std::uint32_t queueCellLoad, tryCancel, waitTasks, postProcess, loaderGlobal;
-                const char* queuePrologue;
             };
             static constexpr ExtLoader KNOWN[] = {
-                { 1, 5, 97, 0x24ad30, 0x24afc0, 0x24b150, 0x24b2f0, 0x2ec5cf8,
-                  "48 85 D2 0F 84 68 02 00 00 48 8B C4 57 41 54 41 55 41 56 41 57 48 83 EC" },   // SE 1.5.97
-                { 1, 6, 1170, 0x29c530, 0x29c7b0, 0x29c990, 0x29cb80, 0x30fdb38,
-                  "48 85 D2 0F 84 57 02 00 00 4C 8B DC 56 57 41 55 41 56 41 57 48 83 EC 50" },   // AE 1.6.1170
-                { 1, 4, 15, 0x25c420, 0x25c6b0, 0x25c840, 0x25c9e0, 0x2f8abc8,
-                  "48 85 D2 0F 84 6B 02 00 00 48 8B C4 57 41 54 41 55 41 56 41 57 48 83 EC" },   // VR 1.4.15
+                { 1, 5, 97,   0x24ad30, 0x24afc0, 0x24b150, 0x24b2f0, 0x2ec5cf8 },   // SE 1.5.97
+                { 1, 6, 1170, 0x29c530, 0x29c7b0, 0x29c990, 0x29cb80, 0x30fdb38 },   // AE 1.6.1170 (Steam)
+                { 1, 4, 15,   0x25c420, 0x25c6b0, 0x25c840, 0x25c9e0, 0x2f8abc8 },   // VR 1.4.15
             };
             const auto ver = REL::Module::get().version();
             const ExtLoader* k = nullptr;
@@ -198,11 +149,6 @@ namespace FasterLoadscreens
                 return;
             }
             const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
-            if (!scan::MatchAt(reinterpret_cast<const std::uint8_t*>(base + k->queueCellLoad),
-                               scan::Parse(k->queuePrologue))) {
-                logger::warn("DoorPrefetch: ExteriorCellLoader QueueCellLoad @ {:x} failed prologue validation — exterior preload disabled", k->queueCellLoad);
-                return;
-            }
             s_queueCellLoad = reinterpret_cast<QueueCellLoadFn>(base + k->queueCellLoad);
             s_tryCancel = reinterpret_cast<TryCancelFn>(base + k->tryCancel);
             s_waitTasks = reinterpret_cast<WaitFn>(base + k->waitTasks);
@@ -331,6 +277,7 @@ namespace FasterLoadscreens
                 }
             }
             if (fired > 0) {
+                s_queuedExterior.store(true, std::memory_order_relaxed);
                 logger::info("DoorPrefetch: queued {} cold cells (grid r={}) via tracked ExteriorCellLoader around ({},{}) via {}",
                     fired, radius, coords->cellX, coords->cellY, a_source);
             }
@@ -368,8 +315,15 @@ namespace FasterLoadscreens
                 if (!destWS || destWS == playerWS) {
                     return;  // same/unknown worldspace -> would risk the live-grid shove
                 }
+                // Exterior: route through the engine's OWN tracked ExteriorCellLoader
+                // (QueueCellLoad) and reconcile it at the transition via FlushQueuedLoads,
+                // instead of the untracked single-cell QueuePreload that left an orphaned
+                // task for the engine's transition to double-integrate (vanishing refs /
+                // falling havok). radius from iPrefetchGridRadius (0 = just the dest cell).
+                PreloadExteriorGrid(cell, destWS, a_source);
+                return;
             }
-            PreloadCell(cell, a_source);  // QueuePreload single cell (interior + different-WS exterior)
+            PreloadCell(cell, a_source);  // interior single-cell (safe, self-contained)
         }
 
         // The game's activation pick ray length (Skyrim.ini [Interface]
@@ -550,13 +504,23 @@ namespace FasterLoadscreens
     // (unknown runtime) or isn't live yet. Runs at the DisplayLoadingScreen hook.
     void DoorPrefetchHook::FlushQueuedLoads()
     {
-        if (!s_extLoaderPtr || !*s_extLoaderPtr || !s_postProcess || !s_tryCancel || !s_waitTasks) {
+        // Only reconcile when WE queued exterior cells this transition — otherwise we'd
+        // run the shared cell-loader's Finish on the engine's OWN transition tasks.
+        if (!s_queuedExterior.exchange(false)) {
+            return;
+        }
+        if (!s_extLoaderPtr || !*s_extLoaderPtr || !s_postProcess || !s_tryCancel) {
             return;
         }
         void* loader = *s_extLoaderPtr;
-        s_postProcess(loader);            // integrate already-completed loads
-        if (s_tryCancel(loader)) {        // cancel queued-but-not-started (returns count)
-            s_waitTasks(loader);          // wait for + integrate the still-in-flight ones
-        }
+        s_postProcess(loader);  // integrate already-completed loads (state 2->3, non-blocking)
+        s_tryCancel(loader);    // cancel queued-but-not-started (non-blocking; count ignored)
+        // WaitForTasks REMOVED. RE (FUN_140dfdd00) shows it is an UNBOUNDED spin-wait:
+        //   while (task.state in {3,4}) { pump_io(); Sleep(0/1); }   // no timeout, no exit
+        // If an in-flight task can't complete (starved IO worker — which Display Tweaks
+        // aggravates but does NOT cause), it spins forever -> infinite loadscreen. Dropping
+        // it makes this deadlock-proof by construction: integrate what finished, cancel the
+        // rest, never block. The transition loads anything we cancelled, normally.
+        logger::info("DoorPrefetch: FlushQueuedLoads — postProcess + tryCancel (no wait)");
     }
 }

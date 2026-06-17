@@ -64,7 +64,7 @@ namespace FasterLoadscreens
         // worldspace guard in DoorPrefetchHook: only cells in a DIFFERENT worldspace
         // than the player are preloaded (those can't be in the active grid, so the
         // engine background-loads them without the crash-prone grid insertion).
-        bool prefetchExteriorCells = true;
+        bool prefetchExteriorCells = false;
 
         // Exterior arrival-grid radius. 0 = single destination cell; 2 = the engine's
         // 5x5 uGridsToLoad window. >0 enables the COLD-ONLY arrival-grid preload, which

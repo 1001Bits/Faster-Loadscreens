@@ -2,7 +2,6 @@
 #include "LoadingLoopHook.h"
 #include "Config.h"
 #include "DoorPrefetchHook.h"
-#include "PatternScan.h"
 
 #include <Windows.h>
 #include <MinHook.h>
@@ -12,32 +11,14 @@ namespace FasterLoadscreens
     namespace
     {
         // ============================================================
-        // Signatures (?? = wildcard). Each verified to match exactly once:
-        //   flat: SE 1.5.97 and AE 1.6.1170
-        //   vr:   SkyrimVR 1.4.15
+        // Hardcoded hook RVAs per verified runtime. No signature scan: an
+        // unrecognized build resolves to nothing and the hook is simply not
+        // installed (fail-safe). A mis-resolved scan once rerouted doors on an
+        // unmapped GOG build, so we only act on versions we have verified.
+        // NOTE: version() alone cannot tell Steam from GOG for a SHARED build
+        // number (e.g. 1.6.659 exists on both with different addresses) — only
+        // add such an entry behind an explicit Steam/GOG check, never bare.
         // ============================================================
-
-        // JobListManager::ServingThread state-check: the loading loop's
-        // condition function. `state` lives at +0x68 (SE/AE) / +0x70 (VR).
-        constexpr const char* SIG_STATECHECK_FLAT =
-            "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 12 85 C9 75 07 "
-            "39 48 68 0F 95 C0 C3 39 48 68 0F 94 C0 C3";
-        constexpr const char* SIG_STATECHECK_VR =
-            "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 12 85 C9 75 07 "
-            "39 48 70 0F 95 C0 C3 39 48 70 0F 94 C0 C3";
-
-        // JobListManager::ServingThread::DisplayLoadingScreen
-        constexpr const char* SIG_DLS_FLAT =
-            "40 57 48 83 EC 50 48 C7 44 24 30 FE FF FF FF 48 89 5C 24 68 "
-            "0F 29 74 24 40 48 8B 0D ?? ?? ?? ?? 48 85 C9 74 05 "
-            "E8 ?? ?? ?? ?? 48 8D 3D ?? ?? ?? ?? 0F 57 F6 "
-            "B9 02 00 00 00 E8 ?? ?? ?? ?? 84 C0";
-        constexpr const char* SIG_DLS_VR =
-            "4C 8B DC 57 48 81 EC C0 00 00 00 48 C7 44 24 30 FE FF FF FF "
-            "49 89 5B 10 49 89 6B 18 49 89 73 20 41 0F 29 73 E8 41 0F 29 7B D8 "
-            "48 8D 2D ?? ?? ?? ?? 0F 57 F6 48 8B 05 ?? ?? ?? ?? 48 85 C0 0F 84";
-
-        // Known-version fast paths (signature still verified at the RVA).
         struct KnownRVAs
         {
             std::uint16_t major, minor, patch;
@@ -45,31 +26,24 @@ namespace FasterLoadscreens
         };
         constexpr KnownRVAs KNOWN[] = {
             { 1, 5, 97,   0x63FA50, 0x5763B0 },   // SE 1.5.97
-            { 1, 6, 1170, 0x6D2120, 0x5FBFF0 },   // AE 1.6.1170
+            { 1, 6, 1170, 0x6D2120, 0x5FBFF0 },   // AE 1.6.1170 (Steam)
+            { 1, 6, 1179, 0x6D4350, 0x5FE350 },   // AE 1.6.1179 (GOG) — Ghidra-verified
             { 1, 4, 15,   0x648AE0, 0x57C980 },   // VR 1.4.15
         };
 
         // ============================================================
-        // Target resolution (shared scanner + known-RVA fast path)
+        // Target resolution — hardcoded RVA only (fail-safe, no scan)
         // ============================================================
 
-        std::uintptr_t Resolve(const scan::Pattern& p, std::uint32_t knownRva, const char* tag)
+        std::uintptr_t Resolve(std::uint32_t knownRva, const char* tag)
         {
+            if (!knownRva) {
+                logger::warn("{}: no known RVA for this runtime — not hooking", tag);
+                return 0;
+            }
             const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleA(nullptr));
-            if (knownRva) {
-                const auto addr = base + knownRva;
-                if (scan::MatchAt(reinterpret_cast<const std::uint8_t*>(addr), p)) {
-                    logger::info("{}: resolved via known RVA {:x}", tag, knownRva);
-                    return addr;
-                }
-                logger::warn("{}: bytes at known RVA {:x} don't match — falling back to scan",
-                    tag, knownRva);
-            }
-            const auto addr = scan::FindUnique(p, tag);
-            if (addr) {
-                logger::info("{}: resolved via signature scan at RVA {:x}", tag, addr - base);
-            }
-            return addr;
+            logger::info("{}: resolved via known RVA {:x}", tag, knownRva);
+            return base + knownRva;
         }
 
         // ============================================================
@@ -124,10 +98,11 @@ namespace FasterLoadscreens
                 }
             }
 
-            // (Reverted: the tracked-ExteriorCellLoader grid + its FlushQueuedLoads reconcile
-            //  are gone — door prefetch is back to the fast single-cell QueuePreload that gave
-            //  the -55%. Running the loader's Finish here with nothing of ours queued risked
-            //  touching the engine's OWN transition loads and slowing every transition.)
+            // Drain our tracked exterior-grid preloads into this transition (Wall's pattern):
+            // integrate the cells that finished early, cancel the rest. Self-gates on "we
+            // actually queued this transition" so idle transitions never touch the engine's
+            // own loader tasks. Non-blocking (no WaitForTasks) -> cannot deadlock, DT or not.
+            DoorPrefetchHook::FlushQueuedLoads();
 
             // NEUTRALIZE (mode 2): drop THIS (the loading serving) thread to LOWEST
             // priority for the duration of the loading screen. DT's loading-screen
@@ -259,9 +234,10 @@ namespace FasterLoadscreens
             }
         }
 
-        const auto dlsPattern = scan::Parse(s_isVR ? SIG_DLS_VR : SIG_DLS_FLAT);
-        const auto dlsAddr = Resolve(dlsPattern, dlsRva, "DisplayLoadingScreen");
+        const auto dlsAddr = Resolve(dlsRva, "DisplayLoadingScreen");
         if (!dlsAddr) {
+            logger::warn("LoadingLoopHook: unsupported runtime {}.{}.{} — not installing (fail-safe)",
+                ver[0], ver[1], ver[2]);
             return false;
         }
 
@@ -294,8 +270,7 @@ namespace FasterLoadscreens
 
         // Throttle/freeze — full mode only.
         if (wantThrottle) {
-            const auto checkPattern = scan::Parse(s_isVR ? SIG_STATECHECK_VR : SIG_STATECHECK_FLAT);
-            const auto checkAddr = Resolve(checkPattern, checkRva, "ServingThread::stateCheck");
+            const auto checkAddr = Resolve(checkRva, "ServingThread::stateCheck");
             if (checkAddr) {
                 hook(checkAddr, reinterpret_cast<void*>(&HookedStateCheck),
                     reinterpret_cast<void**>(&s_origStateCheck), "ServingThread::stateCheck");
