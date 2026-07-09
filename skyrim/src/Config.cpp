@@ -8,28 +8,49 @@ namespace FasterLoadscreens
     namespace
     {
         constexpr const char* INI_REL_PATH = "Data\\SKSE\\Plugins\\FasterLoadscreens.ini";
+        // MCM Helper writes user changes here (ModSetting sources). Values in
+        // this file OVERRIDE the base INI — without reading it, the MCM menu
+        // silently did nothing in earlier builds.
+        constexpr const char* MCM_REL_PATH = "Data\\MCM\\Settings\\FasterLoadscreens.ini";
 
-        std::string IniPath()
+        std::string AbsPath(const char* a_rel)
         {
             // GetPrivateProfile* resolves relative paths against the Windows
             // directory, not the CWD — build an absolute path from the CWD
             // (SKSE plugins start with CWD = game root).
             char cwd[MAX_PATH]{};
             ::GetCurrentDirectoryA(MAX_PATH, cwd);
-            return std::string(cwd) + "\\" + INI_REL_PATH;
+            return std::string(cwd) + "\\" + a_rel;
         }
 
-        int ReadInt(const char* path, const char* section, const char* key, int def)
+        // Two-layer read: MCM settings override the base INI; the base INI
+        // overrides compiled defaults. "Key absent" falls through a layer.
+        std::string s_basePath;
+        std::string s_mcmPath;
+        bool s_hasMcm = false;
+
+        bool HasKey(const char* path, const char* section, const char* key)
         {
-            return static_cast<int>(::GetPrivateProfileIntA(section, key, def, path));
+            char buf[8]{};
+            ::GetPrivateProfileStringA(section, key, "\x01", buf, sizeof(buf), path);
+            return buf[0] != '\x01';
         }
 
-        bool ReadBool(const char* path, const char* section, const char* key, bool def)
+        int ReadInt(const char* section, const char* key, int def)
         {
-            return ReadInt(path, section, key, def ? 1 : 0) != 0;
+            int v = static_cast<int>(::GetPrivateProfileIntA(section, key, def, s_basePath.c_str()));
+            if (s_hasMcm && HasKey(s_mcmPath.c_str(), section, key)) {
+                v = static_cast<int>(::GetPrivateProfileIntA(section, key, v, s_mcmPath.c_str()));
+            }
+            return v;
         }
 
-        float ReadFloat(const char* path, const char* section, const char* key, float def)
+        bool ReadBool(const char* section, const char* key, bool def)
+        {
+            return ReadInt(section, key, def ? 1 : 0) != 0;
+        }
+
+        float ReadFloatFrom(const char* path, const char* section, const char* key, float def)
         {
             char buf[64]{};
             ::GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), path);
@@ -40,55 +61,75 @@ namespace FasterLoadscreens
             const float v = std::strtof(buf, &end);
             return end != buf ? v : def;
         }
+
+        float ReadFloat(const char* section, const char* key, float def)
+        {
+            float v = ReadFloatFrom(s_basePath.c_str(), section, key, def);
+            if (s_hasMcm) {
+                v = ReadFloatFrom(s_mcmPath.c_str(), section, key, v);
+            }
+            return v;
+        }
     }
 
     void Config::Load()
     {
-        const std::string pathStr = IniPath();
-        const char* path = pathStr.c_str();
+        s_basePath = AbsPath(INI_REL_PATH);
+        s_mcmPath  = AbsPath(MCM_REL_PATH);
+        s_hasMcm   = ::GetFileAttributesA(s_mcmPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (s_hasMcm) {
+            logger::info("Config: MCM settings overlay found at {}", s_mcmPath);
+        }
 
-        benchmarkMode = ReadInt(path, "Benchmark", "iMode", benchmarkMode);
+        benchmarkMode = ReadInt("Benchmark", "iMode", benchmarkMode);
         if (benchmarkMode != 0) benchmarkMode = 1;
 
-        loopMode = ReadInt(path, "LoadingScreen", "iLoopMode", -1);  // -1 = auto (resolved below)
-        throttleMs = ReadInt(path, "LoadingScreen", "iThrottleMs", throttleMs);
-        throttleMsVR = ReadInt(path, "LoadingScreen", "iThrottleMsVR", throttleMsVR);
-        freezeAfterFrames = ReadInt(path, "LoadingScreen", "iFreezeAfterFrames", freezeAfterFrames);
-        displayTweaksMode = ReadInt(path, "LoadingScreen", "iDisplayTweaksMode", displayTweaksMode);
+        loopMode = ReadInt("LoadingScreen", "iLoopMode", -1);  // -1 = auto (resolved below)
+        throttleMs = ReadInt("LoadingScreen", "iThrottleMs", throttleMs);
+        throttleMsVR = ReadInt("LoadingScreen", "iThrottleMsVR", throttleMsVR);
+        freezeAfterFrames = ReadInt("LoadingScreen", "iFreezeAfterFrames", freezeAfterFrames);
+        displayTweaksMode = ReadInt("LoadingScreen", "iDisplayTweaksMode", displayTweaksMode);
 
-        boostPriority = ReadBool(path, "Boost", "bBoostPriority", boostPriority);
-        loadingQueuedPriorityBudgetMs = ReadInt(path, "Boost", "iLoadingQueuedPriorityBudgetMs",
+        boostPriority = ReadBool("Boost", "bBoostPriority", boostPriority);
+        loadingQueuedPriorityBudgetMs = ReadInt("Boost", "iLoadingQueuedPriorityBudgetMs",
             loadingQueuedPriorityBudgetMs);
-        backgroundBudgetMs = ReadInt(path, "Boost", "iBackgroundBudgetMs", backgroundBudgetMs);
+        backgroundBudgetMs = ReadInt("Boost", "iBackgroundBudgetMs", backgroundBudgetMs);
+        postLoadFinalizeBudgetMs = ReadInt("Boost", "iPostLoadFinalizeBudgetMs", postLoadFinalizeBudgetMs);
 
-        minSecondsForLoadFadeIn = ReadFloat(path, "Fades", "fMinSecondsForLoadFadeIn", minSecondsForLoadFadeIn);
-        loadGameFadeSecs = ReadFloat(path, "Fades", "fLoadGameFadeSecs", loadGameFadeSecs);
-        fadeToBlackFadeSeconds = ReadFloat(path, "Fades", "fFadeToBlackFadeSeconds", fadeToBlackFadeSeconds);
-        fastTravelFadeSecs = ReadFloat(path, "Fades", "fFastTravelFadeSecs", fastTravelFadeSecs);
-        autoDoorFadeSecs = ReadFloat(path, "Fades", "fAutoDoorFadeSecs", autoDoorFadeSecs);
-        normalDoorFadeSecs = ReadFloat(path, "Fades", "fNormalDoorFadeSecs", normalDoorFadeSecs);
-        normalDoorFadeWait = ReadFloat(path, "Fades", "fNormalDoorFadeWait", normalDoorFadeWait);
+        scriptSettleEnable = ReadBool("ScriptSettle", "bEnable", scriptSettleEnable);
+        scriptBoostBudgetMS = ReadFloat("ScriptSettle", "fScriptBoostBudgetMS", scriptBoostBudgetMS);
+        scriptBoostSecs = ReadInt("ScriptSettle", "iScriptBoostSecs", scriptBoostSecs);
+        forceMcmRegistration = ReadBool("ScriptSettle", "bForceMcmRegistration", forceMcmRegistration);
+        mcmNudgeDelaySecs = ReadInt("ScriptSettle", "iMcmNudgeDelaySecs", mcmNudgeDelaySecs);
 
-        postLoadUpdateTimeMS = ReadFloat(path, "Papyrus", "fPostLoadUpdateTimeMS", postLoadUpdateTimeMS);
+        minSecondsForLoadFadeIn = ReadFloat("Fades", "fMinSecondsForLoadFadeIn", minSecondsForLoadFadeIn);
+        loadGameFadeSecs = ReadFloat("Fades", "fLoadGameFadeSecs", loadGameFadeSecs);
+        fadeToBlackFadeSeconds = ReadFloat("Fades", "fFadeToBlackFadeSeconds", fadeToBlackFadeSeconds);
+        fastTravelFadeSecs = ReadFloat("Fades", "fFastTravelFadeSecs", fastTravelFadeSecs);
+        autoDoorFadeSecs = ReadFloat("Fades", "fAutoDoorFadeSecs", autoDoorFadeSecs);
+        normalDoorFadeSecs = ReadFloat("Fades", "fNormalDoorFadeSecs", normalDoorFadeSecs);
+        normalDoorFadeWait = ReadFloat("Fades", "fNormalDoorFadeWait", normalDoorFadeWait);
 
-        prefetchCellOnCrosshairDoor = ReadBool(path, "Prefetch", "bPrefetchCellOnCrosshairDoor", prefetchCellOnCrosshairDoor);
-        prefetchPollMs = ReadInt(path, "Prefetch", "iPrefetchPollMs", prefetchPollMs);
-        prefetchDoorCooldownMs = ReadInt(path, "Prefetch", "iPrefetchDoorCooldownMs", prefetchDoorCooldownMs);
-        prefetchExtendedRay = ReadBool(path, "Prefetch", "bPrefetchExtendedRay", prefetchExtendedRay);
-        prefetchRangeMult = ReadFloat(path, "Prefetch", "fPrefetchRangeMult", prefetchRangeMult);
-        prefetchExteriorCells = ReadBool(path, "Prefetch", "bPrefetchExteriorCells", prefetchExteriorCells);
-        prefetchGridRadius = ReadInt(path, "Prefetch", "iPrefetchGridRadius", prefetchGridRadius);
+        postLoadUpdateTimeMS = ReadFloat("Papyrus", "fPostLoadUpdateTimeMS", postLoadUpdateTimeMS);
 
-        sceneReadyHoldEnable = ReadBool(path, "SceneReadyHold", "bEnable", sceneReadyHoldEnable);
-        sceneReadyMaxHoldMs = ReadInt(path, "SceneReadyHold", "iMaxHoldMs", sceneReadyMaxHoldMs);
-        sceneReadyTickMs = ReadInt(path, "SceneReadyHold", "iTickMs", sceneReadyTickMs);
-        sceneReadyStreak = ReadInt(path, "SceneReadyHold", "iReadyStreak", sceneReadyStreak);
-        sceneReadyWaitActors = ReadBool(path, "SceneReadyHold", "bWaitActors", sceneReadyWaitActors);
-        sceneReadyRadius = ReadFloat(path, "SceneReadyHold", "fActorRadius", sceneReadyRadius);
-        sceneReadyMaxActors = ReadInt(path, "SceneReadyHold", "iMaxActors", sceneReadyMaxActors);
-        sceneReadyActorPct = ReadInt(path, "SceneReadyHold", "iActorPct", sceneReadyActorPct);
-        sceneReadyWaitGrass = ReadBool(path, "SceneReadyHold", "bWaitGrass", sceneReadyWaitGrass);
-        sceneReadyGrassBudgetMs = ReadInt(path, "SceneReadyHold", "iGrassBudgetMs", sceneReadyGrassBudgetMs);
+        prefetchCellOnCrosshairDoor = ReadBool("Prefetch", "bPrefetchCellOnCrosshairDoor", prefetchCellOnCrosshairDoor);
+        prefetchPollMs = ReadInt("Prefetch", "iPrefetchPollMs", prefetchPollMs);
+        prefetchDoorCooldownMs = ReadInt("Prefetch", "iPrefetchDoorCooldownMs", prefetchDoorCooldownMs);
+        prefetchExtendedRay = ReadBool("Prefetch", "bPrefetchExtendedRay", prefetchExtendedRay);
+        prefetchRangeMult = ReadFloat("Prefetch", "fPrefetchRangeMult", prefetchRangeMult);
+        prefetchExteriorCells = ReadBool("Prefetch", "bPrefetchExteriorCells", prefetchExteriorCells);
+        prefetchGridRadius = ReadInt("Prefetch", "iPrefetchGridRadius", prefetchGridRadius);
+
+        sceneReadyHoldEnable = ReadBool("SceneReadyHold", "bEnable", sceneReadyHoldEnable);
+        sceneReadyMaxHoldMs = ReadInt("SceneReadyHold", "iMaxHoldMs", sceneReadyMaxHoldMs);
+        sceneReadyTickMs = ReadInt("SceneReadyHold", "iTickMs", sceneReadyTickMs);
+        sceneReadyStreak = ReadInt("SceneReadyHold", "iReadyStreak", sceneReadyStreak);
+        sceneReadyWaitActors = ReadBool("SceneReadyHold", "bWaitActors", sceneReadyWaitActors);
+        sceneReadyRadius = ReadFloat("SceneReadyHold", "fActorRadius", sceneReadyRadius);
+        sceneReadyMaxActors = ReadInt("SceneReadyHold", "iMaxActors", sceneReadyMaxActors);
+        sceneReadyActorPct = ReadInt("SceneReadyHold", "iActorPct", sceneReadyActorPct);
+        sceneReadyWaitGrass = ReadBool("SceneReadyHold", "bWaitGrass", sceneReadyWaitGrass);
+        sceneReadyGrassBudgetMs = ReadInt("SceneReadyHold", "iGrassBudgetMs", sceneReadyGrassBudgetMs);
 
         // Clamp to sane ranges
         // -1 (or absent) = auto: throttle on flat, OFF on VR — the VR loading loop
@@ -113,6 +154,14 @@ namespace FasterLoadscreens
         }
         if (prefetchGridRadius < 0) prefetchGridRadius = 0;
         if (prefetchGridRadius > 4) prefetchGridRadius = 4;       // 9x9 cap
+
+        if (postLoadFinalizeBudgetMs > 1000) postLoadFinalizeBudgetMs = 1000;
+        if (scriptBoostBudgetMS < 0.0f) scriptBoostBudgetMS = 0.0f;   // 0/neg = disabled boost
+        if (scriptBoostBudgetMS > 16.0f) scriptBoostBudgetMS = 16.0f; // never eat a whole frame
+        if (scriptBoostSecs < 0) scriptBoostSecs = 0;
+        if (scriptBoostSecs > 120) scriptBoostSecs = 120;
+        if (mcmNudgeDelaySecs < 5) mcmNudgeDelaySecs = 5;
+        if (mcmNudgeDelaySecs > 120) mcmNudgeDelaySecs = 120;
 
         if (sceneReadyMaxHoldMs < 0) sceneReadyMaxHoldMs = 0;
         if (sceneReadyMaxHoldMs > 15000) sceneReadyMaxHoldMs = 15000;

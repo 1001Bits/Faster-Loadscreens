@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "faster-loadscreens-skyrim",
+  "version": "1.6.0",
+  "description": "Loading screen speedups for Skyrim SE/AE/VR (loop throttle, door prefetch, fade tweaks)",
+  "dependencies": [
+    "commonlibsse-ng",
+    "spdlog",
+    "minhook"
+  ]
+}

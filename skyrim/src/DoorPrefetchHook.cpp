@@ -485,6 +485,8 @@ namespace FasterLoadscreens
         ResolveExteriorLoader();  // AE-1.6.1170-only tracked loader; null elsewhere
         s_isVR = REL::Module::IsVR();
         s_running.store(true);
+        // Stop the detached poller at CRT teardown (crash-on-exit guard).
+        std::atexit([]() { s_running.store(false, std::memory_order_relaxed); });
         std::thread(PollerThread).detach();
         logger::info("DoorPrefetch: installed (crosshair cell preload active)");
         return true;

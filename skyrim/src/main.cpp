@@ -5,6 +5,7 @@
 #include "GameSettingTweaks.h"
 #include "LoadingLoopHook.h"
 #include "SceneReadyHold.h"
+#include "ScriptSettle.h"
 
 #include <Windows.h>
 #include <ShlObj.h>  // SHGetKnownFolderPath / FOLDERID_Documents
@@ -164,6 +165,10 @@ namespace
                     ::SetPriorityClass(::GetCurrentProcess(), HIGH_PRIORITY_CLASS);
                     m_boosted = true;
                 }
+                // Raise the object-finalize budget for the duration of the
+                // load only. (Restored on close — leaving it raised caused a
+                // multi-second post-load FPS tank.)
+                GameSettingTweaks::OnLoadScreenOpen();
                 logger::info("Loading Menu OPEN (load #{})", m_loadCount);
             } else {
                 if (m_boosted) {
@@ -184,8 +189,11 @@ namespace
                 }
 
                 // Re-assert our setting values in case another mod or the
-                // engine rewrote them during the load.
+                // engine rewrote them during the load, then drop the finalize
+                // budget back to its baseline so leftover queued refs drain
+                // gently instead of eating whole frames.
                 GameSettingTweaks::Apply();
+                GameSettingTweaks::OnLoadScreenClose();
             }
             return RE::BSEventNotifyControl::kContinue;
         }
@@ -212,6 +220,10 @@ namespace
             DoorPrefetchHook::Install();
             SceneReadyHold::Install();
             if (!s_visiblePollRun.exchange(true)) {
+                // Stop the detached poller at CRT teardown — a detached thread
+                // calling AddTask/logging during static destruction is a
+                // crash-on-exit source.
+                std::atexit([]() { s_visiblePollRun.store(false, std::memory_order_relaxed); });
                 std::thread(VisiblePollerThread).detach();
                 logger::info("Black-screen-to-playable measure: poller started");
             }
@@ -224,11 +236,19 @@ namespace
         case SKSE::MessagingInterface::kNewGame:
             SceneReadyHold::CancelPendingHold();
             GameSettingTweaks::Apply();
+            // Fresh save: give the mod-initialization script burst real VM
+            // time, and (optionally) force the SkyUI MCM registration sweep.
+            ScriptSettle::OnGameLoaded(true);
             break;
         case SKSE::MessagingInterface::kPostLoadGame:
-            // Settings like fPostLoadUpdateTimeMS can be re-read/reset around
-            // save load; re-assert.
+            // Re-read config first: MCM Helper writes user changes to
+            // Data\MCM\Settings\FasterLoadscreens.ini, and reloading here is
+            // what makes MCM edits take effect without a game restart (all
+            // consumers read Config::Get() live). Then re-assert settings —
+            // fPostLoadUpdateTimeMS etc. can be reset around save load.
+            Config::Get().Load();
             GameSettingTweaks::Apply();
+            ScriptSettle::OnGameLoaded(false);
             break;
         default:
             break;
@@ -238,12 +258,14 @@ namespace
 
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
+    // SKSE::Init first: it wires up the interfaces (messaging, task, trampoline)
+    // that everything below may touch. Log init follows immediately so any
+    // failure after this point is still captured.
+    SKSE::Init(a_skse);
     InitializeLog();
 
     const auto plugin = SKSE::PluginDeclaration::GetSingleton();
     logger::info("{} v{} loading", plugin->GetName(), plugin->GetVersion());
-
-    SKSE::Init(a_skse);
 
     const auto ver = REL::Module::get().version();
     logger::info("Runtime: Skyrim{} v{}", REL::Module::IsVR() ? " VR" : "", ver.string());

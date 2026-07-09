@@ -29,8 +29,37 @@ namespace FasterLoadscreens
 
         // [Boost]
         bool boostPriority = true;
-        int loadingQueuedPriorityBudgetMs = 500;  // vanilla 20, -1 = leave
+        int loadingQueuedPriorityBudgetMs = 500;  // vanilla 20, -1 = leave; applied ONLY while the loading menu is open
         int backgroundBudgetMs = -1;              // vanilla 5, -1 = leave
+        // Finalize budget after the loading menu CLOSES. The raised loading
+        // budget must not persist into gameplay: the engine keeps draining
+        // leftover queued refs on the main thread each frame, and at 500 ms
+        // per pump that reads as "FPS tanks for ~10s after every load".
+        // -1 = restore the vanilla value captured at startup (20).
+        int postLoadFinalizeBudgetMs = -1;
+
+        // [ScriptSettle] — give mod scripts room to initialize cleanly.
+        // On new game / save load the Papyrus VM gets a mass of OnInit /
+        // OnPlayerLoadGame work; at the vanilla 1.2 ms/frame budget a big
+        // modlist takes minutes to settle and some mods appear "not
+        // initialized". Temporarily raising the VM budgets right after the
+        // event lets initialization finish during the first seconds.
+        // Only the Papyrus VM budget boost runs by default — it writes two
+        // existing game Setting floats on the game thread, nothing more, so it
+        // cannot destabilize a load. This is what actually helps mods finish
+        // OnInit / OnPlayerLoadGame quickly on a big list.
+        bool  scriptSettleEnable = true;
+        float scriptBoostBudgetMS = 4.0f;   // fUpdateBudgetMS + fExtraTaskletBudgetMS during settle (vanilla 1.2)
+        int   scriptBoostSecs = 20;         // settle window length
+        // New-game only: force a SkyUI MCM registration sweep shortly after
+        // game start (setstage SKI_ConfigManagerInstance 1). EXPERIMENTAL and
+        // OFF by default — it executes a console command from a background
+        // timer, which is fragile on a still-initializing new game and was a
+        // suspected CTD source in v1.7.0. The VM budget boost above already
+        // gives SkyUI's own registration the cycles it needs; only enable this
+        // if MCMs still fail to appear. Only fires if SkyUI is installed.
+        bool  forceMcmRegistration = false;
+        int   mcmNudgeDelaySecs = 15;
 
         // [Fades] — negative = leave vanilla
         float minSecondsForLoadFadeIn = 0.0001f;  // vanilla 1.5
@@ -84,8 +113,14 @@ namespace FasterLoadscreens
         // instantly when the scene is already ready, waits only when it isn't,
         // and never past iMaxHoldMs. We suppress only the loading-menu kHide
         // message; all other end-of-load engine work runs normally.
-        bool sceneReadyHoldEnable = false;  // experimental; off (see INI note)
-        int sceneReadyMaxHoldMs = 2000;     // hard cap on the deferral (safety)
+        // EXPERIMENTAL, OFF by default. This defers the engine's loading-menu
+        // close via a hardcoded-RVA hook and fires on EVERY load — a suspected
+        // CTD source in v1.7.0 on heavy modlists, and the reason the original
+        // author shipped it off. The load-scoped finalize budget + SceneReady
+        // are NOT needed for the FPS-tank fix; that fix lives entirely in the
+        // GameSettingTweaks open/close budget restore. Enable only to test.
+        bool sceneReadyHoldEnable = false;
+        int sceneReadyMaxHoldMs = 4000;     // hard cap on the deferral (safety)
         int sceneReadyTickMs = 33;          // readiness re-check cadence (~30 Hz)
         int sceneReadyStreak = 2;           // consecutive ready ticks before close
         bool sceneReadyWaitActors = true;   // wait for nearby actors' 3D

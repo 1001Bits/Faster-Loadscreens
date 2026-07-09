@@ -328,6 +328,8 @@ namespace FasterLoadscreens
         }
 
         s_running.store(true);
+        // Stop the detached poller at CRT teardown (crash-on-exit guard).
+        std::atexit([]() { s_running.store(false, std::memory_order_relaxed); });
         std::thread(PollerThread).detach();
         logger::info("SceneReadyHold: installed (maxHold={}ms tick={}ms streak={} waitActors={} "
                      "radius={:.0f} maxActors={} actorPct={} waitGrass={} grassBudget={}ms)",
