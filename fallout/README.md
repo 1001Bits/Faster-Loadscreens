@@ -63,15 +63,18 @@ changing it; it is deliberately not exposed as a live MCM control.
 
 ## Installation
 
-Install with your mod manager of choice (Mod Organizer 2 recommended). The mod folder structure:
+Install the ZIP with your mod manager of choice (Mod Organizer 2 recommended).
+Its root contains these folders directly:
 
 ```
-Data/
-  F4SE/Plugins/LoadingScreens.dll
-  MCM/Config/FasterLoadscreens/config.json
-  MCM/Config/FasterLoadscreens/settings.ini
-  Textures/LoadingScreens/*.DDS
+F4SE/Plugins/LoadingScreens.dll
+MCM/Config/FasterLoadscreens/config.json
+MCM/Config/FasterLoadscreens/settings.ini
+Textures/LoadingScreens/*.DDS
 ```
+
+For a manual installation, extract these folders into the game's `Data/`
+directory. Release archives must not include a top-level `Data/` folder.
 
 Add your own landscape DDS images (DXT1/DXT5, 2048x1024) to
 `Data/Textures/LoadingScreens/` for custom backgrounds. The curated release
@@ -108,7 +111,7 @@ ctest --test-dir build -C Release -R "^(policy_logic|worldspace_preload_lifetime
 ```
 
 For release validation and packaging, copy the release's
-`Data/Textures/LoadingScreens/*.dds` into
+`Textures/LoadingScreens/*.dds` into
 `release/Faster Loadscreens/Textures/LoadingScreens/`. Then create the complete
 release ZIP from the current DLL, both MCM files, and all 80 loading-screen assets:
 

@@ -18,7 +18,9 @@ if (-not (Test-Path -LiteralPath $dataRoot -PathType Container)) {
 
 $files = @(
     Get-ChildItem -LiteralPath $dataRoot -File -Recurse | ForEach-Object {
-        $relative = $_.FullName.Substring($stageRoot.Length + 1).Replace('\', '/')
+        # Package the Data directory's contents: F4SE, MCM, and Textures
+        # belong directly at the ZIP root for mod-manager installation.
+        $relative = $_.FullName.Substring($dataRoot.Length + 1).Replace('\', '/')
         [pscustomobject]@{
             Relative = $relative
             FullName = $_.FullName

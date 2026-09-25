@@ -2,6 +2,9 @@
 
 ## 2.1.1
 
+Release ZIPs now place `F4SE`, `MCM`, and `Textures` directly at the archive
+root, with validation rejecting a top-level `Data` wrapper.
+
 Fixed missing destination-world initialization in exterior gate preloading
 (GitHub issue #2). The engine now creates the destination's portal graph,
 multibound maps, and nodes before queueing its arrival cell. Scene attachment

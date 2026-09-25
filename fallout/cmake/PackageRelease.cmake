@@ -124,13 +124,20 @@ if(NOT _archive_entry_count EQUAL 83)
 endif()
 
 set(_required_archive_entries
-    "Data/F4SE/Plugins/LoadingScreens.dll"
-    "Data/MCM/Config/FasterLoadscreens/config.json"
-    "Data/MCM/Config/FasterLoadscreens/settings.ini"
+    "F4SE/Plugins/LoadingScreens.dll"
+    "MCM/Config/FasterLoadscreens/config.json"
+    "MCM/Config/FasterLoadscreens/settings.ini"
 )
 foreach(_required_entry IN LISTS _required_archive_entries)
     if(NOT _required_entry IN_LIST _archive_entries)
         message(FATAL_ERROR "Release archive is missing ${_required_entry}")
+    endif()
+endforeach()
+
+foreach(_entry IN LISTS _archive_entries)
+    if(NOT _entry MATCHES "^(F4SE|MCM|Textures)/")
+        message(FATAL_ERROR
+            "Release files must be at the archive root without a Data wrapper: ${_entry}")
     endif()
 endforeach()
 
