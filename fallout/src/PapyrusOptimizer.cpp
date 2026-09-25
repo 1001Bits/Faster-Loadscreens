@@ -1,10 +1,19 @@
 #include "PCH.h"
 #include "PapyrusOptimizer.h"
+#include "RuntimePolicy.h"
 
 namespace VRLoadingScreens
 {
     void PapyrusOptimizer::Init(float maxFPS, float budgetBase)
     {
+        if (m_externalOwner.load(std::memory_order_acquire)) {
+            m_enabled.store(false, std::memory_order_release);
+            logger::info(
+                "DynamicUpdateBudget: disabled because HFPF owns "
+                "fUpdateBudgetMS:Papyrus");
+            return;
+        }
+
         float fpsMin = 60.0f;
         float fpsMax = std::clamp(maxFPS, fpsMin, 300.0f);
         float base = std::clamp(budgetBase, 0.1f, 4.0f);
@@ -28,14 +37,20 @@ namespace VRLoadingScreens
             return;
         }
 
-        m_enabled = true;
+        m_enabled.store(true, std::memory_order_release);
         logger::info("DynamicUpdateBudget: base={} ms, range=[{:.4f}, {:.4f}], bmult={:.2f}",
             base, m_t_min * m_bmult, m_t_max * m_bmult, m_bmult);
     }
 
     void PapyrusOptimizer::Update()
     {
-        if (!m_enabled) return;
+        if (!Policy::ShouldRunPapyrusUpdater(
+                m_enabled.load(std::memory_order_acquire),
+                m_gameSessionActive.load(std::memory_order_acquire),
+                m_loading.load(std::memory_order_acquire),
+                m_externalOwner.load(std::memory_order_acquire))) {
+            return;
+        }
 
         // Read current frame delta from BSTimer
         auto* timer = RE::BSTimer::GetSingleton();
@@ -52,6 +67,51 @@ namespace VRLoadingScreens
         }
 
         float budget = m_lastInterval * m_bmult;
-        m_budgetSetting->SetFloat(budget);
+        m_pendingBudget.store(budget, std::memory_order_relaxed);
+
+        // Update() runs from the VR Submit callback. RE::Setting is game-owned
+        // state, so write it on the F4SE game-task queue rather than from the
+        // render thread. Four updates per second are plenty for this smoothed
+        // budget and avoid flooding the queue at 90 Hz.
+        const auto nowTicks = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto lastTicks = m_lastQueueTicks.load(std::memory_order_relaxed);
+        const auto elapsed = std::chrono::steady_clock::duration(nowTicks - lastTicks);
+        if (elapsed < std::chrono::milliseconds(250)) return;
+        m_lastQueueTicks.store(nowTicks, std::memory_order_relaxed);
+        if (m_applyTaskQueued.exchange(true, std::memory_order_acq_rel)) return;
+
+        if (auto* tasks = F4SE::GetTaskInterface()) {
+            tasks->AddTask([this]() {
+                if (Policy::ShouldRunPapyrusUpdater(
+                        m_enabled.load(std::memory_order_acquire),
+                        m_gameSessionActive.load(std::memory_order_acquire),
+                        m_loading.load(std::memory_order_acquire),
+                        m_externalOwner.load(std::memory_order_acquire)) &&
+                    m_budgetSetting) {
+                    m_budgetSetting->SetFloat(m_pendingBudget.load(std::memory_order_relaxed));
+                }
+                m_applyTaskQueued.store(false, std::memory_order_release);
+            });
+        } else {
+            m_applyTaskQueued.store(false, std::memory_order_release);
+        }
+    }
+
+    void PapyrusOptimizer::SetGameSessionActive(bool a_active) noexcept
+    {
+        m_gameSessionActive.store(a_active, std::memory_order_release);
+    }
+
+    void PapyrusOptimizer::SetLoading(bool a_loading) noexcept
+    {
+        m_loading.store(a_loading, std::memory_order_release);
+    }
+
+    void PapyrusOptimizer::SetExternalOwner(bool a_owned) noexcept
+    {
+        m_externalOwner.store(a_owned, std::memory_order_release);
+        if (a_owned) {
+            m_enabled.store(false, std::memory_order_release);
+        }
     }
 }

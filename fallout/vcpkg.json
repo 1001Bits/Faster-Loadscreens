@@ -1,6 +1,6 @@
 {
-  "name": "vr-loading-screens",
-  "version": "1.0.0",
+  "name": "faster-loadscreens",
+  "version": "2.1.1",
   "dependencies": [
     "rsm-mmio",
     "spdlog",

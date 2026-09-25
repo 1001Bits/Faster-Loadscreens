@@ -19,6 +19,103 @@
                 "sourceType": "ModSettingInt",
                 "options": ["Black screen", "Native (no 3D)", "Background", "Background + Tips"]
             }
+        },
+        {
+            "id": "bPreloadSaveOnConfirm:Main",
+            "text": "Preload save on confirm",
+            "type": "toggle",
+            "help": "Warms up to 128 MiB of the selected local save in the Windows file cache before Fallout begins loading it.",
+            "valueOptions": {
+                "sourceType": "ModSettingBool"
+            }
+        },
+        {
+            "text": "Fades",
+            "type": "section"
+        },
+        {
+            "type": "spacer"
+        },
+        {
+            "id": "bVanillaFades:Main",
+            "text": "Vanilla fades",
+            "type": "toggle",
+            "help": "Restores the six runtime fade and scene-settle values when enabled, or uses the custom durations below when disabled.",
+            "valueOptions": {
+                "sourceType": "ModSettingBool"
+            }
+        },
+        {
+            "id": "fMinSecondsForLoadFadeIn:Main",
+            "text": "Scene settle",
+            "type": "slider",
+            "help": "Sets how long custom mode holds the loaded world behind the fade-in so NPCs and animations settle before reveal.",
+            "valueOptions": {
+                "min": 0.0,
+                "max": 2.0,
+                "step": 0.1,
+                "sourceType": "ModSettingFloat"
+            }
+        },
+        {
+            "id": "fLoadGameFadeSecs:Main",
+            "text": "Load game fade",
+            "type": "slider",
+            "help": "Sets the save-loading fade duration used when Vanilla fades is off.",
+            "valueOptions": {
+                "min": 0.0,
+                "max": 2.0,
+                "step": 0.1,
+                "sourceType": "ModSettingFloat"
+            }
+        },
+        {
+            "id": "fFadeToBlackFadeSeconds:Main",
+            "text": "Fade to black",
+            "type": "slider",
+            "help": "Sets the fade-to-black duration used for transitions such as fast travel when Vanilla fades is off.",
+            "valueOptions": {
+                "min": 0.0,
+                "max": 2.0,
+                "step": 0.1,
+                "sourceType": "ModSettingFloat"
+            }
+        },
+        {
+            "id": "fAutoDoorFadeSecs:Main",
+            "text": "Auto door fade",
+            "type": "slider",
+            "help": "Sets the automatic-door transition fade duration used when Vanilla fades is off.",
+            "valueOptions": {
+                "min": 0.0,
+                "max": 2.0,
+                "step": 0.1,
+                "sourceType": "ModSettingFloat"
+            }
+        },
+        {
+            "id": "fNormalDoorFadeSecs:Main",
+            "text": "Door fade",
+            "type": "slider",
+            "help": "Sets the normal-door transition fade duration used when Vanilla fades is off.",
+            "valueOptions": {
+                "min": 0.0,
+                "max": 2.0,
+                "step": 0.1,
+                "sourceType": "ModSettingFloat"
+            }
+        },
+        {
+            "id": "fNormalDoorFadeWait:Main",
+            "text": "Door fade wait",
+            "type": "slider",
+            "help": "Sets the delay before a normal-door fade begins when Vanilla fades is off.",
+            "valueOptions": {
+                "min": 0.0,
+                "max": 1.0,
+                "step": 0.05,
+                "sourceType": "ModSettingFloat"
+            }
         }
     ]
 }
